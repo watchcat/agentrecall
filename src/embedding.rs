@@ -1,7 +1,6 @@
-#![allow(dead_code)] // Opt-in adapter contract; the default service deliberately has no model wired.
-
-//! Local embedding adapter contract. Implementations must not send memory text to a
-//! third party unless the owner has explicitly configured and approved that provider.
+//! Local, in-process embedding adapter contract. The CLI can opt into BGE-M3 through
+//! `AGENTRECALL_EMBEDDING_PROVIDER=bge-m3`; memory text must not be sent to a third party
+//! without the owner's informed configuration and approval.
 
 use std::{path::PathBuf, sync::Mutex};
 

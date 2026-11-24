@@ -46,7 +46,7 @@ Each side commits local operations before responding. Replication exchanges dura
 
 Provision matching DuckDB extensions explicitly for the pinned build and service account with `agentrecall install-vss` (and `agentrecall install-fts` for BM25). Startup only loads installed extensions; it does not download them. VSS HNSW indexes are rebuildable, per-owner/per-namespace in-memory projections. Persisted embeddings carry model/version/dimension/revision metadata; do not enable experimental HNSW disk persistence. If VSS cannot load or an index/query fails, the service uses exact vector scoring over persisted embeddings filtered by owner and namespace; if no embedding provider is active, search stays lexical.
 
-This repository defines the embedding adapter contract but does not ship or wire a production model into the CLI. To enable semantic retrieval, the service integration must explicitly inject an owner-approved local/in-process provider through `MemoryService::with_embedding_provider`; do not send memory text to a third party without the user's informed configuration. Readiness reports `search_mode` and `search_engine`, and should show hybrid/HNSW or hybrid/exact mode only while semantic configuration is active. See [VSS notes](vss-reference.md).
+The CLI includes an opt-in local BGE-M3 provider. Set `AGENTRECALL_EMBEDDING_PROVIDER=bge-m3` to enable semantic retrieval; first use may download model assets to the local cache, while embeddings run in process and memory text stays local. Without this setting, search remains lexical. Readiness reports `search_mode` and `search_engine`, and should show hybrid/HNSW or hybrid/exact mode only while semantic configuration is active. See [VSS notes](vss-reference.md).
 
 ## Hermes local-first router
 

@@ -27,7 +27,84 @@ use crate::{
     },
 };
 
-const MIGRATION_001: &str = include_str!("../migrations/001_init.sql");
+#[derive(Clone, Copy)]
+struct SqlMigration {
+    version: i64,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[SqlMigration] = &[SqlMigration {
+    version: 1,
+    sql: include_str!("../migrations/001_init.sql"),
+}];
+
+fn migration_checksum(sql: &str) -> String {
+    hex::encode(Sha256::digest(sql.as_bytes()))
+}
+
+fn apply_migrations(
+    connection: &mut Connection,
+    migrations: &[SqlMigration],
+) -> anyhow::Result<()> {
+    for (index, migration) in migrations.iter().enumerate() {
+        let expected = i64::try_from(index + 1)?;
+        anyhow::ensure!(
+            migration.version == expected,
+            "migration list must be contiguous from version 1"
+        );
+    }
+
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version BIGINT PRIMARY KEY,
+            applied_at VARCHAR NOT NULL,
+            checksum VARCHAR NOT NULL
+        );",
+    )?;
+
+    let mut statement =
+        connection.prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut applied = Vec::new();
+    for row in rows {
+        applied.push(row?);
+    }
+    drop(statement);
+
+    anyhow::ensure!(
+        applied.len() <= migrations.len(),
+        "database contains unknown migration history"
+    );
+    for (index, (version, checksum)) in applied.iter().enumerate() {
+        let migration = migrations[index];
+        anyhow::ensure!(
+            *version == migration.version,
+            "database migration history is unknown or noncontiguous"
+        );
+        anyhow::ensure!(
+            *checksum == migration_checksum(migration.sql),
+            "checksum mismatch for applied migration {}",
+            migration.version
+        );
+    }
+
+    for migration in migrations.iter().skip(applied.len()) {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(migration.sql)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at, checksum) VALUES (?, ?, ?)",
+            params![
+                migration.version,
+                Utc::now().to_rfc3339(),
+                migration_checksum(migration.sql)
+            ],
+        )?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -42,7 +119,6 @@ pub struct Store {
     quota_per_owner: i64,
 }
 
-#[allow(dead_code)] // Used when an opt-in embedding provider is configured.
 const SEMANTIC_INDEX_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
 const VSS_CANDIDATE_LIMIT: usize = 256;
 const MIN_SEMANTIC_COSINE_SIMILARITY: f32 = 0.15;
@@ -97,8 +173,8 @@ impl Store {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)?;
-        connection.execute_batch(MIGRATION_001)?;
+        let mut connection = Connection::open(path)?;
+        apply_migrations(&mut connection, MIGRATIONS).context("apply database migrations")?;
         let stored_id = connection
             .query_row(
                 "SELECT value FROM service_meta WHERE key='replica_id'",
@@ -199,7 +275,6 @@ impl Store {
 
     /// Enable semantic search with an explicitly supplied local/in-process adapter.
     /// Embeddings are derived rows and the HNSW projection always lives in memory.
-    #[allow(dead_code)] // Runtime embedding providers are intentionally opt-in.
     pub fn configure_embeddings(
         &self,
         provider: Arc<dyn EmbeddingProvider>,
@@ -1526,7 +1601,6 @@ fn load_persisted_embedding(
         .filter(|v| validate_vector(v, model.dimension)))
 }
 
-#[allow(dead_code)] // Called by the opt-in provider configuration path.
 fn clear_vector_projection(connection: &Connection) -> duckdb::Result<()> {
     let mut statement = connection.prepare(
         "SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'vss_scope_%'",
@@ -1577,7 +1651,6 @@ fn build_hnsw_index(connection: &Connection, table: &str) -> duckdb::Result<()> 
     ))
 }
 
-#[allow(dead_code)] // Called by the opt-in provider configuration path.
 fn build_all_hnsw_indexes(connection: &Connection, _dimension: usize) -> duckdb::Result<()> {
     let mut statement = connection.prepare(
         "SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'vss_scope_%'",
@@ -2106,6 +2179,69 @@ mod tests {
     use crate::domain::Provenance;
     use std::collections::HashSet;
     use tempfile::tempdir;
+
+    #[test]
+    fn migrations_create_history_and_reopen_legacy_database() {
+        let mut connection = Connection::open_in_memory().expect("connection");
+        apply_migrations(&mut connection, MIGRATIONS).expect("initial migration");
+        let history = connection
+            .query_row(
+                "SELECT version, checksum FROM schema_migrations",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("migration history");
+        assert_eq!(history.0, 1);
+        assert_eq!(history.1, migration_checksum(MIGRATIONS[0].sql));
+        apply_migrations(&mut connection, MIGRATIONS).expect("reopen migrated database");
+
+        let mut legacy = Connection::open_in_memory().expect("legacy connection");
+        legacy
+            .execute_batch(MIGRATIONS[0].sql)
+            .expect("legacy schema");
+        apply_migrations(&mut legacy, MIGRATIONS).expect("adopt existing schema");
+        let count: i64 = legacy
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("legacy history");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migrations_reject_checksum_mismatch_and_roll_back_failed_sql() {
+        let mut connection = Connection::open_in_memory().expect("connection");
+        apply_migrations(&mut connection, MIGRATIONS).expect("initial migration");
+        connection
+            .execute(
+                "UPDATE schema_migrations SET checksum='tampered' WHERE version=1",
+                [],
+            )
+            .expect("tamper test history");
+        let error = apply_migrations(&mut connection, MIGRATIONS).expect_err("checksum mismatch");
+        assert!(error.to_string().contains("checksum mismatch"));
+
+        let mut failing = Connection::open_in_memory().expect("failing connection");
+        let migrations = [SqlMigration {
+            version: 1,
+            sql: "CREATE TABLE must_rollback (id INTEGER); THIS IS NOT SQL;",
+        }];
+        assert!(apply_migrations(&mut failing, &migrations).is_err());
+        let table_exists: i64 = failing
+            .query_row(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name='must_rollback'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect rollback");
+        assert_eq!(table_exists, 0);
+        let history: i64 = failing
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .expect("inspect history");
+        assert_eq!(history, 0);
+    }
 
     fn auth(owner: &str, client: &str) -> AuthContext {
         AuthContext {

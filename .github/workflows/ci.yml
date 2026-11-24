@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Rust 1.100.0 checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.100.0
+        uses: dtolnay/rust-toolchain@1.100.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run strict Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run all-target tests
+        run: cargo test --all-targets
+
+      - name: Build release binaries
+        run: cargo build --release
+
+      - name: Check dependency policy
+        run: cargo deny check
+
+      # Chrono is currently unmaintained and has no safe RustSec upgrade.
+      - name: Audit dependencies for advisories
+        run: cargo audit --ignore RUSTSEC-2026-0543

@@ -268,25 +268,30 @@ async fn serve() -> anyhow::Result<()> {
                 config.db_path.display()
             )
         })?;
-    if config.embedding_provider.as_deref() == Some("bge-m3") {
+    let memory = if config.embedding_provider.as_deref() == Some("bge-m3") {
         tracing::info!(
             "initializing local BGE-M3 embeddings (first run may download model assets)"
         );
         let provider: Arc<dyn EmbeddingProvider> = Arc::new(BgeM3Provider::new(Some(
             config.embedding_cache_dir.clone(),
         ))?);
-        store
-            .configure_embeddings(provider)
-            .map_err(|_| anyhow::anyhow!("configure local BGE-M3 embeddings failed"))?;
+        let memory = MemoryService::with_embedding_provider(
+            store.clone(),
+            config.cursor_secret.clone(),
+            provider,
+        )
+        .map_err(|_| anyhow::anyhow!("configure local BGE-M3 embeddings failed"))?;
         tracing::info!(
-            semantic_ready = store.semantic_ready(),
-            search_engine = store.search_engine(),
+            semantic_ready = memory.store().semantic_ready(),
+            search_engine = memory.store().search_engine(),
             "local BGE-M3 embedding provider configured"
         );
-    }
+        memory
+    } else {
+        MemoryService::new(store.clone(), config.cursor_secret.clone())
+    };
     tracing::info!(replica_id = %store.replica_id(), role = %config.role, "shared-memory service starting");
     let auth = AuthStore::load(&config.tokens_file)?;
-    let memory = MemoryService::new(store.clone(), config.cursor_secret.clone());
     let state = AppState::new(config.clone(), auth, memory);
     if let (Some(peer_url), Some(peer_token), Some(peer_replica_id)) = (
         config.peer_url.clone(),

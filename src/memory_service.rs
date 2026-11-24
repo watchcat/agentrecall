@@ -49,7 +49,7 @@ impl MemoryService {
         &self.store
     }
 
-    #[allow(dead_code)] // The production CLI remains lexical until a local model is configured.
+    /// Configure a service with an explicitly selected local/in-process embedding provider.
     pub fn with_embedding_provider(
         store: Store,
         cursor_secret: Vec<u8>,

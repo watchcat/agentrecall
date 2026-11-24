@@ -13,14 +13,12 @@ This command performs the extension install/download only when an operator invok
 The index uses `stemmer='none'` and `stopwords='none'` to avoid treating the configured multilingual corpus as English. See [the official FTS notes](fts-reference.md).
 
 ## Provisioning semantic search
-
 Provision VSS explicitly for the pinned DuckDB build and service account with:
-
 ```sh
 cargo run --release -- install-vss
 ```
 
-Startup only loads VSS; it never downloads extensions. The service can persist derived embeddings and rebuild per-owner/per-namespace HNSW projections in memory when a local/in-process `EmbeddingProvider` is injected. It synchronously recreates the affected scope's HNSW index after vector mutations to make updates immediately visible. Before search candidate retrieval, expired records are also removed from persisted embeddings, FTS and live vector projections, and the affected HNSW scope is rebuilt; measure resulting write and search latency with the production model and data size. If VSS/index/query is unavailable, scoped exact vector scoring remains available; if no provider is configured, search remains lexical. This repository does not ship or wire a production embedding model into the CLI. See [VSS implementation notes](vss-reference.md) and [deployment guidance](deployment.md#semantic-search).
+Startup only loads VSS; it never downloads extensions. The CLI can opt into the built-in local BGE-M3 provider with `AGENTRECALL_EMBEDDING_PROVIDER=bge-m3`; first use may download model assets to the local cache, while inference runs in process and memory text stays local. The service persists derived embeddings and rebuilds per-owner/per-namespace HNSW projections in memory. It synchronously recreates the affected scope's HNSW index after vector mutations to make updates immediately visible. Before search candidate retrieval, expired records are also removed from persisted embeddings, FTS and live vector projections, and the affected HNSW scope is rebuilt; measure resulting write and search latency with the production model and data size. If VSS/index/query is unavailable, scoped exact vector scoring remains available; without the provider setting, search remains lexical. See [VSS implementation notes](vss-reference.md) and [deployment guidance](deployment.md#semantic-search).
 
 ## Conflict review and resolution
 

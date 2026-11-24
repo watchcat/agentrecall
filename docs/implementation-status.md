@@ -18,9 +18,15 @@ Before the BGE-M3 provider and Rust 1.100 migration, the core checks passed: `ca
 
 ## Current BGE-M3 and Rust status
 
-Rust 1.100.0 is installed. The following checks passed locally: `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets` (26 passed), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build --release`, and `cargo run --release -- --help`.
+The final source and locked dependency graph passed Rust 1.100.0 validation on the Mac mini: `cargo fmt --all -- --check`, `cargo test --locked --all-targets` (28 passed), strict all-target/all-feature Clippy, release build, and CLI `--help`; `cargo deny check` and `cargo audit --ignore RUSTSEC-2026-0543` also passed. `cargo deny` reports existing duplicate-version warnings, and the audit reports a non-failing unmaintained-`paste` warning. Rand was updated to patched 0.10.1 and the optional Quinn protocol dependency to patched 0.11.19. The only ignored RustSec entry is Chrono's unmaintained notice; RustSec reports no safe upgrade.
 
-The 26-test run passed after the optional DuckDB FTS extension was explicitly installed and the HTTP integration-test `Config` fixture was made explicitly provider-disabled (`embedding_provider: None`) with a temporary model-cache directory. Optional extensions are not downloaded automatically at startup.
+### Dependency advisory notes
+
+- `rand` is pinned to patched 0.10.1 for [RUSTSEC-2026-0097](https://rustsec.org/advisories/RUSTSEC-2026-0097.html).
+- The lockfile uses `quinn-proto` 0.11.19 to resolve the Reqwest HTTP/3 advisories [RUSTSEC-2026-0338](https://rustsec.org/advisories/RUSTSEC-2026-0338.html), [RUSTSEC-2026-0339](https://rustsec.org/advisories/RUSTSEC-2026-0339.html), [RUSTSEC-2026-0340](https://rustsec.org/advisories/RUSTSEC-2026-0340.html), [RUSTSEC-2026-0341](https://rustsec.org/advisories/RUSTSEC-2026-0341.html), [RUSTSEC-2026-0342](https://rustsec.org/advisories/RUSTSEC-2026-0342.html), [RUSTSEC-2026-0523](https://rustsec.org/advisories/RUSTSEC-2026-0523.html), and [RUSTSEC-2026-0524](https://rustsec.org/advisories/RUSTSEC-2026-0524.html).
+- The only ignored advisory is Chrono's unmaintained notice, [RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543.html); RustSec says there is no safe upgrade. `cargo audit` still reports the non-failing unmaintained `paste` notice, [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html), for which no fixed upgrade is available.
+
+The final 28-test run includes coverage for fresh and legacy numbered migrations, checksum mismatch, and rollback. The HTTP integration-test `Config` fixture remains explicitly provider-disabled (`embedding_provider: None`) with a temporary model-cache directory. The optional DuckDB FTS extension was explicitly installed for local validation; optional extensions are not downloaded automatically at startup.
 
 The project includes an opt-in local FastEmbed BGE-M3 (`BGEM3Q`) provider with 1024-dimensional output, selected using `AGENTRECALL_EMBEDDING_PROVIDER=bge-m3`. Model assets are fetched from Hugging Face on first initialization if not already cached; inference runs locally in process. An isolated service smoke initialized the actual model in 42.7 seconds, saved a Cantonese memory, then retrieved it with an English query.
 

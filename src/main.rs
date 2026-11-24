@@ -110,6 +110,15 @@ enum Command {
         #[arg(long, required = true)]
         verify: bool,
     },
+    /// Seed a new peer from a verified backup using a fresh stable replica identity.
+    SeedPeer {
+        #[arg(long)]
+        backup: PathBuf,
+        #[arg(long)]
+        database: PathBuf,
+        #[arg(long)]
+        replica_id: String,
+    },
     /// Show retained replication conflicts. Stop the service before opening its database file.
     ListConflicts {
         #[arg(
@@ -205,6 +214,23 @@ async fn main() -> anyhow::Result<()> {
                 report.local_sequence,
                 report.mutation_events,
                 report.peers
+            );
+            Ok(())
+        }
+        Command::SeedPeer {
+            backup: source,
+            database,
+            replica_id,
+        } => {
+            let report = backup::seed_peer_database(&source, &database, &replica_id)?;
+            println!(
+                "Seeded and verified {} as replica {} from {} at source sequence {} ({} cursor baselines, {} retained mutation events).",
+                database.display(),
+                report.replica_id,
+                report.source_replica_id,
+                report.source_local_sequence,
+                report.cursor_baselines,
+                report.mutation_events
             );
             Ok(())
         }

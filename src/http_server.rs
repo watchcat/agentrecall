@@ -297,6 +297,36 @@ mod tests {
     use std::{collections::HashSet, fs};
     use tempfile::tempdir;
     use tokio::net::TcpListener;
+    use tower::ServiceExt;
+
+    async fn post_replication(
+        app: &Router,
+        token: Option<&str>,
+        source_replica_id: &str,
+    ) -> Response {
+        let payload = serde_json::json!({
+            "source_replica_id": source_replica_id,
+            "remote_cursor": 0,
+            "events": []
+        });
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/_internal/replication/exchange")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        app.clone()
+            .oneshot(
+                request
+                    .body(Body::from(
+                        serde_json::to_vec(&payload).expect("encode request"),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("dispatch replication request")
+    }
 
     #[test]
     fn origin_comparison_uses_exact_scheme_host_port() {
@@ -323,6 +353,63 @@ mod tests {
             HeaderValue::from_static("https://cue.example.org/path"),
         );
         assert!(!origin_is_allowed(&headers, &allowed));
+    }
+
+    #[tokio::test]
+    async fn replication_exchange_requires_bearer_and_trusted_stable_replica_id() {
+        let directory = tempdir().expect("temporary test directory");
+        let tokens_path = directory.path().join("tokens.json");
+        fs::write(&tokens_path, b"[]").expect("write empty MCP credentials");
+        let auth = AuthStore::load(&tokens_path).expect("load empty MCP credentials");
+        let database = directory.path().join("cloud.duckdb");
+        let store =
+            crate::store::Store::open(&database, "cloud-stable", 100).expect("open cloud replica");
+        let memory = MemoryService::new(store, vec![3; 32]);
+        let config = Config {
+            bind: "127.0.0.1:0".parse().expect("parse bind address"),
+            db_path: database,
+            tokens_file: tokens_path,
+            replica_id: "cloud-stable".into(),
+            role: "cloud".into(),
+            allowed_hosts: Vec::new(),
+            allowed_origins: Vec::new(),
+            cursor_keys: crate::memory_service::CursorSigningKeys::current_only(vec![3; 32]),
+            quota_per_owner: 100,
+            replication_token: Some("replication-acceptance-token".into()),
+            peer_url: None,
+            peer_token: None,
+            peer_replica_id: None,
+            trusted_replica_id: Some("local-stable".into()),
+            embedding_provider: None,
+            embedding_cache_dir: directory.path().join("models"),
+        };
+        let app = build_app(
+            AppState::new(config, auth, memory),
+            CancellationToken::new(),
+        );
+
+        assert_eq!(
+            post_replication(&app, None, "local-stable").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_replication(&app, Some("wrong-token"), "local-stable")
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_replication(&app, Some("replication-acceptance-token"), "other-local")
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_replication(&app, Some("replication-acceptance-token"), "local-stable")
+                .await
+                .status(),
+            StatusCode::OK
+        );
     }
 
     #[tokio::test]

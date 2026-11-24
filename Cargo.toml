@@ -39,6 +39,7 @@ uuid = { version = "=1.18.1", features = ["serde", "v4", "v7"] }
 [dev-dependencies]
 http-body-util = "0.1"
 tempfile = "3.23"
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -61,6 +61,8 @@ AGENTRECALL_CURSOR_HMAC_SECRET=<at-least-32-random-bytes>
 
 The cloud side sets `AGENTRECALL_REPLICATION_TOKEN` to the credential sent by the local service and `AGENTRECALL_TRUSTED_REPLICA_ID` to that local service's stable ID. The service rejects an authenticated exchange if its declared source ID differs from this trusted ID. The token is separate from Cue/Hermes client tokens. Use different secrets from MCP credentials, rotate them deliberately, and never place them in MCP tool arguments. `AGENTRECALL_REPLICA_ID` must remain stable for the life of a database file; if omitted at first startup, the service creates and persists one, which is returned in readiness metadata. Obtain each replica ID from its operator/deployment configuration, not from a client-supplied argument.
 
+For a new database created with `agentrecall seed-peer`, set `AGENTRECALL_REPLICA_ID` to the exact `--replica-id` value used during seeding. Configure the opposite side's trusted/peer replica ID to match this new identity before reconnecting.
+
 Each side commits local operations before responding. Replication exchanges durable sequence-ordered events and resumes after restart. Cross-replica visibility is eventual. Do not copy DuckDB files to synchronize them.
 
 ## Semantic search

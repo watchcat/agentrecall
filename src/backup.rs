@@ -21,6 +21,15 @@ pub struct BackupVerification {
     pub peers: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSeedVerification {
+    pub source_replica_id: String,
+    pub replica_id: String,
+    pub source_local_sequence: i64,
+    pub cursor_baselines: usize,
+    pub mutation_events: usize,
+}
+
 /// Create a private, checkpointed DuckDB file without replacing an existing backup.
 /// The source connection holds DuckDB's process lock through the copy.
 pub fn backup_database(database: &Path, output: &Path) -> anyhow::Result<BackupVerification> {
@@ -85,6 +94,165 @@ pub fn restore_database(
     }
     install_no_replace(&staged, &destination)?;
     verify_database(&destination)
+}
+
+/// Seed a new replica from a verified backup without changing the backup or replacing a file.
+pub fn seed_peer_database(
+    backup: &Path,
+    destination: &Path,
+    new_replica_id: &str,
+) -> anyhow::Result<PeerSeedVerification> {
+    anyhow::ensure!(
+        !new_replica_id.trim().is_empty()
+            && new_replica_id.chars().count() <= 128
+            && !new_replica_id.chars().any(char::is_control),
+        "new replica ID must contain 1 to 128 non-control characters"
+    );
+    let source = fs::canonicalize(backup).context("resolve verified backup path")?;
+    let source_report = verify_database(&source)?;
+    let destination = canonical_destination(destination)?;
+    ensure_new_destination(&destination)?;
+    anyhow::ensure!(
+        source != destination,
+        "seed destination must differ from the backup"
+    );
+
+    let staged = stage_copy(&source, &destination)?;
+    let stage_result = (|| -> anyhow::Result<PeerSeedVerification> {
+        let mut connection = Connection::open(&staged).context("open staged peer seed")?;
+        apply_migrations(&mut connection, MIGRATIONS).context("migrate staged peer seed")?;
+        let tx = connection.transaction()?;
+        let source_replica_id = tx.query_row(
+            "SELECT value FROM service_meta WHERE key='replica_id'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        let source_sequence_text = tx.query_row(
+            "SELECT value FROM service_meta WHERE key='local_sequence'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        let source_local_sequence = source_sequence_text
+            .parse::<i64>()
+            .context("snapshot local sequence is not an integer")?;
+        anyhow::ensure!(
+            source_replica_id == source_report.replica_id
+                && source_local_sequence == source_report.local_sequence,
+            "verified backup identity or sequence changed while preparing peer seed"
+        );
+        anyhow::ensure!(
+            new_replica_id != source_replica_id,
+            "new replica ID must differ from the snapshot source identity"
+        );
+        let identity_in_use: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM replica_state WHERE peer_replica_id=?)
+                 OR EXISTS(SELECT 1 FROM mutation_log WHERE origin_replica_id=?)
+                 OR EXISTS(SELECT 1 FROM event_log_watermarks WHERE origin_replica_id=?)",
+            params![new_replica_id, new_replica_id, new_replica_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            !identity_in_use,
+            "new replica ID already appears in snapshot replication state"
+        );
+
+        {
+            let mut statement = tx.prepare(
+                "SELECT current_version_event_json FROM memories
+                 WHERE current_version_event_json IS NOT NULL",
+            )?;
+            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                let event: MutationEvent = serde_json::from_str(&row?)
+                    .context("invalid current-version event snapshot")?;
+                anyhow::ensure!(
+                    event.origin_replica_id != new_replica_id,
+                    "new replica ID already appears in a current-version snapshot"
+                );
+            }
+        }
+        {
+            let mut statement = tx.prepare("SELECT branches_json FROM replication_conflicts")?;
+            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                let branches: Vec<MutationEvent> = serde_json::from_str(&row?)
+                    .context("invalid retained replication conflict branches")?;
+                anyhow::ensure!(
+                    branches
+                        .iter()
+                        .all(|event| event.origin_replica_id != new_replica_id),
+                    "new replica ID already appears in a retained conflict branch"
+                );
+            }
+        }
+
+        tx.execute(
+            "UPDATE service_meta SET value=? WHERE key='replica_id'",
+            params![new_replica_id],
+        )?;
+        tx.execute(
+            "UPDATE service_meta SET value='0' WHERE key='local_sequence'",
+            [],
+        )?;
+        // Outbound acknowledgements belong to the old replica identity; no peer has
+        // acknowledged events originating from this new identity yet.
+        tx.execute("UPDATE replica_state SET outbound_ack=0", [])?;
+        // The snapshot already contains all state through this boundary, so the new
+        // peer can accept the source's next sequence without replaying pruned history.
+        tx.execute(
+            "INSERT INTO replica_state(peer_replica_id,inbound_cursor,outbound_ack)
+             VALUES (?,?,0)
+             ON CONFLICT(peer_replica_id) DO UPDATE SET
+                 inbound_cursor=excluded.inbound_cursor,outbound_ack=0",
+            params![source_replica_id, source_local_sequence],
+        )?;
+        tx.execute(
+            "DELETE FROM service_meta WHERE key='last_successful_sync_at'",
+            [],
+        )?;
+        tx.commit()?;
+        connection
+            .execute_batch("CHECKPOINT;")
+            .context("checkpoint staged peer seed")?;
+        let verification = verify_connection(&connection)?;
+        anyhow::ensure!(
+            verification.replica_id == new_replica_id && verification.local_sequence == 0,
+            "staged peer seed identity or local sequence is invalid"
+        );
+        let cursor_baselines =
+            connection.query_row("SELECT COUNT(*) FROM replica_state", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        anyhow::ensure!(
+            cursor_baselines >= 1,
+            "peer seed has no source cursor baseline"
+        );
+        drop(connection);
+        Ok(PeerSeedVerification {
+            source_replica_id,
+            replica_id: new_replica_id.to_owned(),
+            source_local_sequence,
+            cursor_baselines: usize::try_from(cursor_baselines)?,
+            mutation_events: verification.mutation_events,
+        })
+    })();
+    let seed_report = match stage_result {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = fs::remove_file(&staged);
+            return Err(error);
+        }
+    };
+    if let Err(error) = install_no_replace(&staged, &destination) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    let installed = verify_database(&destination)?;
+    anyhow::ensure!(
+        installed.replica_id == seed_report.replica_id
+            && installed.local_sequence == 0
+            && installed.mutation_events == seed_report.mutation_events,
+        "installed peer seed does not match its staged verification"
+    );
+    Ok(seed_report)
 }
 
 /// Open an existing database read-only and validate its physical and replication state.
@@ -719,6 +887,111 @@ mod tests {
         assert_eq!(
             verify_database(&restored_path).expect("verify restored file"),
             source_report
+        );
+    }
+
+    #[test]
+    fn peer_seed_assigns_fresh_identity_and_preserves_origin_baselines() {
+        let directory = tempdir().expect("temporary directory");
+        let source_path = directory.path().join("source.duckdb");
+        let origin_path = directory.path().join("origin.duckdb");
+        let backup_path = directory.path().join("source.backup.duckdb");
+        let seed_path = directory.path().join("seed.duckdb");
+        let source = Store::open(&source_path, "source-replica", 100).expect("open source");
+        let origin = Store::open(&origin_path, "origin-replica", 100).expect("open origin");
+        let (source_record, _) = source
+            .save_record(
+                &auth("owner", "cue"),
+                record("source snapshot state"),
+                None,
+                "",
+            )
+            .expect("save source record");
+        let (origin_record, _) = origin
+            .save_record(
+                &auth("owner", "hermes"),
+                record("remote origin state"),
+                None,
+                "",
+            )
+            .expect("save origin record");
+        let origin_events = origin
+            .pending_events("source-replica", 10)
+            .expect("read origin event");
+        assert_eq!(
+            source
+                .apply_remote_events("origin-replica", &origin_events)
+                .expect("apply origin state"),
+            1
+        );
+        source
+            .acknowledge_outbound("old-peer", 1)
+            .expect("create source-identity outbound acknowledgement");
+        drop(origin);
+        drop(source);
+
+        let source_report = backup_database(&source_path, &backup_path).expect("verify backup");
+        let seed_report = seed_peer_database(&backup_path, &seed_path, "seeded-replica")
+            .expect("seed new peer from verified backup");
+        assert_eq!(seed_report.source_replica_id, "source-replica");
+        assert_eq!(seed_report.replica_id, "seeded-replica");
+        assert_eq!(
+            seed_report.source_local_sequence,
+            source_report.local_sequence
+        );
+        assert_eq!(seed_report.cursor_baselines, 3);
+        assert_eq!(seed_report.mutation_events, source_report.mutation_events);
+        assert_eq!(
+            verify_database(&backup_path).expect("source backup remains unchanged"),
+            source_report
+        );
+        assert!(seed_peer_database(&backup_path, &seed_path, "other-seed").is_err());
+        let duplicate_id_path = directory.path().join("duplicate-id.duckdb");
+        assert!(seed_peer_database(&backup_path, &duplicate_id_path, "origin-replica").is_err());
+        assert!(!duplicate_id_path.exists());
+        assert!(Store::open(&seed_path, "source-replica", 100).is_err());
+
+        let seeded = Store::open(&seed_path, "seeded-replica", 100).expect("open seeded peer");
+        assert_eq!(seeded.replica_id(), "seeded-replica");
+        assert_eq!(
+            verify_database(&seed_path)
+                .expect("verify seeded peer")
+                .local_sequence,
+            0
+        );
+        assert_eq!(
+            seeded
+                .inbound_cursor("source-replica")
+                .expect("source snapshot baseline"),
+            source_report.local_sequence
+        );
+        assert_eq!(
+            seeded
+                .inbound_cursor("origin-replica")
+                .expect("third-origin snapshot baseline"),
+            1
+        );
+        assert_eq!(
+            seeded
+                .inbound_cursor("old-peer")
+                .expect("other cursor baseline"),
+            0
+        );
+        assert_eq!(
+            seeded
+                .get_record(&auth("owner", "cue"), &source_record.id, "shared")
+                .expect("read seeded source record")
+                .expect("source record exists")
+                .content,
+            "source snapshot state"
+        );
+        assert_eq!(
+            seeded
+                .get_record(&auth("owner", "hermes"), &origin_record.id, "shared")
+                .expect("read seeded origin record")
+                .expect("origin record exists")
+                .content,
+            "remote origin state"
         );
     }
 

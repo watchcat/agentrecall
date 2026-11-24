@@ -1666,6 +1666,7 @@ impl Store {
         .collect()
     }
 
+    #[cfg(test)]
     pub fn events_after(&self, cursor: i64, limit: usize) -> Result<Vec<MutationEvent>, AppError> {
         let connection = self.lock()?;
         let pruned_through =
@@ -1687,6 +1688,7 @@ impl Store {
         .collect()
     }
 
+    #[cfg(test)]
     pub fn acknowledge_outbound(
         &self,
         peer_replica_id: &str,
@@ -1711,6 +1713,95 @@ impl Store {
         tx.commit().map_err(storage_error)
     }
 
+    /// Apply one inbound exchange atomically, after validating every relevant history watermark.
+    pub fn receive_replication_exchange(
+        &self,
+        peer_replica_id: &str,
+        remote_cursor: i64,
+        events: &[MutationEvent],
+        event_limit: usize,
+    ) -> Result<(i64, Vec<MutationEvent>), AppError> {
+        if remote_cursor < 0 {
+            return Err(AppError::TemporarilyUnavailable);
+        }
+        let mut connection = self.lock()?;
+        let tx = connection.transaction().map_err(storage_error)?;
+        let local_sequence: i64 = tx
+            .query_row(
+                "SELECT CAST(value AS BIGINT) FROM service_meta WHERE key='local_sequence'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)?;
+        let local_watermark = event_log_watermark(&tx, self.replica_id()).map_err(storage_error)?;
+        if remote_cursor < local_watermark || remote_cursor > local_sequence {
+            return Err(AppError::TemporarilyUnavailable);
+        }
+        let current_inbound = inbound_cursor_in_transaction(&tx, peer_replica_id)?;
+        let peer_watermark = event_log_watermark(&tx, peer_replica_id).map_err(storage_error)?;
+        if current_inbound < peer_watermark {
+            return Err(AppError::TemporarilyUnavailable);
+        }
+
+        let (accepted_through, touched_scopes) =
+            apply_remote_events_in_transaction(&tx, peer_replica_id, events)?;
+        tx.execute(
+            "INSERT INTO replica_state(peer_replica_id,inbound_cursor,outbound_ack) VALUES (?,0,?)
+             ON CONFLICT(peer_replica_id) DO UPDATE SET
+                 outbound_ack=GREATEST(replica_state.outbound_ack,excluded.outbound_ack)",
+            params![peer_replica_id, remote_cursor],
+        )
+        .map_err(storage_error)?;
+        let response_events =
+            events_after_in_transaction(&tx, self.replica_id(), remote_cursor, event_limit)?;
+        tx.commit().map_err(storage_error)?;
+        refresh_remote_scopes(self, &mut connection, touched_scopes);
+        Ok((accepted_through, response_events))
+    }
+
+    /// Apply a peer response atomically so an invalid/stale response cannot advance only one cursor.
+    pub fn apply_replication_response(
+        &self,
+        peer_replica_id: &str,
+        accepted_through: i64,
+        events: &[MutationEvent],
+    ) -> Result<(), AppError> {
+        if accepted_through < 0 {
+            return Err(AppError::TemporarilyUnavailable);
+        }
+        let mut connection = self.lock()?;
+        let tx = connection.transaction().map_err(storage_error)?;
+        let local_sequence: i64 = tx
+            .query_row(
+                "SELECT CAST(value AS BIGINT) FROM service_meta WHERE key='local_sequence'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)?;
+        let local_watermark = event_log_watermark(&tx, self.replica_id()).map_err(storage_error)?;
+        if accepted_through < local_watermark || accepted_through > local_sequence {
+            return Err(AppError::TemporarilyUnavailable);
+        }
+        let current_inbound = inbound_cursor_in_transaction(&tx, peer_replica_id)?;
+        let peer_watermark = event_log_watermark(&tx, peer_replica_id).map_err(storage_error)?;
+        if current_inbound < peer_watermark {
+            return Err(AppError::TemporarilyUnavailable);
+        }
+
+        let (_, touched_scopes) = apply_remote_events_in_transaction(&tx, peer_replica_id, events)?;
+        tx.execute(
+            "INSERT INTO replica_state(peer_replica_id,inbound_cursor,outbound_ack) VALUES (?,0,?)
+             ON CONFLICT(peer_replica_id) DO UPDATE SET
+                 outbound_ack=GREATEST(replica_state.outbound_ack,excluded.outbound_ack)",
+            params![peer_replica_id, accepted_through],
+        )
+        .map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+        refresh_remote_scopes(self, &mut connection, touched_scopes);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn apply_remote_events(
         &self,
         peer_replica_id: &str,
@@ -1718,51 +1809,10 @@ impl Store {
     ) -> Result<i64, AppError> {
         let mut connection = self.lock()?;
         let tx = connection.transaction().map_err(storage_error)?;
-        let current_cursor: i64 = tx
-            .query_row(
-                "SELECT inbound_cursor FROM replica_state WHERE peer_replica_id=?",
-                params![peer_replica_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(storage_error)?
-            .unwrap_or(0);
-        let mut cursor = current_cursor;
-        let mut touched_scopes: Vec<(String, String)> = Vec::new();
-        for event in events {
-            if event.origin_replica_id != peer_replica_id {
-                return Err(AppError::TemporarilyUnavailable);
-            }
-            if event.origin_seq <= cursor {
-                continue;
-            }
-            if event.origin_seq != cursor + 1 {
-                return Err(AppError::TemporarilyUnavailable);
-            }
-            apply_event(&tx, event).map_err(storage_error)?;
-            append_event(&tx, event).map_err(storage_error)?;
-            let scope = (event.owner_id.clone(), event.namespace.clone());
-            if !touched_scopes.contains(&scope) {
-                touched_scopes.push(scope);
-            }
-            tx.execute("INSERT INTO applied_events(event_id,origin_replica_id,origin_seq,applied_at) VALUES (?,?,?,?)", params![event.event_id, event.origin_replica_id, event.origin_seq, now_rfc3339()]).map_err(storage_error)?;
-            if let Some(idem) = &event.idempotency {
-                let exists = tx.query_row("SELECT request_fingerprint FROM idempotency_ledger WHERE owner_id=? AND client_id=? AND client_request_id=?", params![event.owner_id, idem.client_id, idem.client_request_id], |row| row.get::<_, String>(0)).optional().map_err(storage_error)?;
-                if exists.is_none() {
-                    tx.execute("INSERT INTO idempotency_ledger(owner_id,client_id,client_request_id,request_fingerprint,result_json,event_id) VALUES (?,?,?,?,?,?)", params![event.owner_id, idem.client_id, idem.client_request_id, idem.request_fingerprint, idem.result_json, event.event_id]).map_err(storage_error)?;
-                }
-            }
-            cursor = event.origin_seq;
-        }
-        tx.execute(
-            "INSERT INTO replica_state(peer_replica_id,inbound_cursor,outbound_ack) VALUES (?,?,0) ON CONFLICT(peer_replica_id) DO UPDATE SET inbound_cursor=GREATEST(replica_state.inbound_cursor, excluded.inbound_cursor)",
-            params![peer_replica_id, cursor],
-        ).map_err(storage_error)?;
+        let (cursor, touched_scopes) =
+            apply_remote_events_in_transaction(&tx, peer_replica_id, events)?;
         tx.commit().map_err(storage_error)?;
-        for (owner_id, namespace) in touched_scopes {
-            self.refresh_fts_scope(&mut connection, &owner_id, &namespace);
-            self.refresh_embeddings_scope(&connection, &owner_id, &namespace);
-        }
+        refresh_remote_scopes(self, &mut connection, touched_scopes);
         Ok(cursor)
     }
 
@@ -1932,6 +1982,129 @@ impl Store {
         self.refresh_fts_scope(&mut connection, owner_id, &namespace);
         self.refresh_embeddings_scope(&connection, owner_id, &namespace);
         Ok(event)
+    }
+}
+
+fn inbound_cursor_in_transaction(
+    tx: &Transaction<'_>,
+    peer_replica_id: &str,
+) -> Result<i64, AppError> {
+    tx.query_row(
+        "SELECT inbound_cursor FROM replica_state WHERE peer_replica_id=?",
+        params![peer_replica_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(|value| value.unwrap_or(0))
+    .map_err(storage_error)
+}
+
+fn apply_remote_events_in_transaction(
+    tx: &Transaction<'_>,
+    peer_replica_id: &str,
+    events: &[MutationEvent],
+) -> Result<(i64, Vec<(String, String)>), AppError> {
+    let mut cursor = inbound_cursor_in_transaction(tx, peer_replica_id)?;
+    let mut touched_scopes: Vec<(String, String)> = Vec::new();
+    for event in events {
+        if event.origin_replica_id != peer_replica_id {
+            return Err(AppError::TemporarilyUnavailable);
+        }
+        if event.origin_seq <= cursor {
+            continue;
+        }
+        if event.origin_seq != cursor + 1 {
+            return Err(AppError::TemporarilyUnavailable);
+        }
+        apply_event(tx, event).map_err(storage_error)?;
+        append_event(tx, event).map_err(storage_error)?;
+        let scope = (event.owner_id.clone(), event.namespace.clone());
+        if !touched_scopes.contains(&scope) {
+            touched_scopes.push(scope);
+        }
+        tx.execute(
+            "INSERT INTO applied_events(event_id,origin_replica_id,origin_seq,applied_at)
+             VALUES (?,?,?,?)",
+            params![
+                event.event_id,
+                event.origin_replica_id,
+                event.origin_seq,
+                now_rfc3339()
+            ],
+        )
+        .map_err(storage_error)?;
+        if let Some(idem) = &event.idempotency {
+            let exists = tx
+                .query_row(
+                    "SELECT request_fingerprint FROM idempotency_ledger
+                     WHERE owner_id=? AND client_id=? AND client_request_id=?",
+                    params![event.owner_id, idem.client_id, idem.client_request_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(storage_error)?;
+            if exists.is_none() {
+                tx.execute(
+                    "INSERT INTO idempotency_ledger
+                     (owner_id,client_id,client_request_id,request_fingerprint,result_json,event_id)
+                     VALUES (?,?,?,?,?,?)",
+                    params![
+                        event.owner_id,
+                        idem.client_id,
+                        idem.client_request_id,
+                        idem.request_fingerprint,
+                        idem.result_json,
+                        event.event_id
+                    ],
+                )
+                .map_err(storage_error)?;
+            }
+        }
+        cursor = event.origin_seq;
+    }
+    tx.execute(
+        "INSERT INTO replica_state(peer_replica_id,inbound_cursor,outbound_ack) VALUES (?,?,0)
+         ON CONFLICT(peer_replica_id) DO UPDATE SET
+             inbound_cursor=GREATEST(replica_state.inbound_cursor,excluded.inbound_cursor)",
+        params![peer_replica_id, cursor],
+    )
+    .map_err(storage_error)?;
+    Ok((cursor, touched_scopes))
+}
+
+fn events_after_in_transaction(
+    tx: &Transaction<'_>,
+    origin_replica_id: &str,
+    cursor: i64,
+    limit: usize,
+) -> Result<Vec<MutationEvent>, AppError> {
+    let mut statement = tx
+        .prepare(
+            "SELECT event_json FROM mutation_log
+             WHERE origin_replica_id=? AND origin_seq>? ORDER BY origin_seq LIMIT ?",
+        )
+        .map_err(storage_error)?;
+    let rows = statement
+        .query_map(params![origin_replica_id, cursor, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(storage_error)?;
+    rows.map(|row| {
+        row.map_err(storage_error).and_then(|json| {
+            serde_json::from_str(&json).map_err(|_| AppError::TemporarilyUnavailable)
+        })
+    })
+    .collect()
+}
+
+fn refresh_remote_scopes(
+    store: &Store,
+    connection: &mut Connection,
+    touched_scopes: Vec<(String, String)>,
+) {
+    for (owner_id, namespace) in touched_scopes {
+        store.refresh_fts_scope(connection, &owner_id, &namespace);
+        store.refresh_embeddings_scope(connection, &owner_id, &namespace);
     }
 }
 
@@ -3007,6 +3180,93 @@ mod tests {
             store.pending_events("peer-replica", 10).is_err(),
             "an unacknowledged outbound peer below the watermark must fail closed"
         );
+        assert!(
+            matches!(
+                crate::replication::receive_exchange(
+                    &store,
+                    crate::replication::SyncRequest {
+                        source_replica_id: "peer-replica".into(),
+                        remote_cursor: 1,
+                        events: Vec::new(),
+                    },
+                ),
+                Err(AppError::TemporarilyUnavailable)
+            ),
+            "the replication exchange must reject an inbound cursor below the watermark"
+        );
+        let peer_path = directory.path().join("peer.duckdb");
+        let stale_peer_id = "stale-peer-exchange";
+        let peer = Store::open(&peer_path, stale_peer_id, 100).expect("open peer replica");
+        let (peer_record, _) = peer
+            .save_record(&owner, record("peer event during stale exchange"), None, "")
+            .expect("save peer event");
+        let pending_before = peer
+            .pending_events("compact-replica", 10)
+            .expect("peer event to send");
+        let receiver_peer_rows_before: i64 = store
+            .lock()
+            .expect("lock compacted store")
+            .query_row(
+                "SELECT COUNT(*) FROM replica_state WHERE peer_replica_id=?",
+                params![stale_peer_id],
+                |row| row.get(0),
+            )
+            .expect("count receiver peer rows");
+        assert_eq!(receiver_peer_rows_before, 0);
+        let stale_request = crate::replication::SyncRequest {
+            source_replica_id: stale_peer_id.into(),
+            remote_cursor: 1,
+            events: pending_before.clone(),
+        };
+        assert!(matches!(
+            crate::replication::receive_exchange(&store, stale_request),
+            Err(AppError::TemporarilyUnavailable)
+        ));
+        assert!(matches!(
+            store.apply_replication_response(stale_peer_id, 1, &pending_before),
+            Err(AppError::TemporarilyUnavailable)
+        ));
+        assert_eq!(
+            store
+                .inbound_cursor(stale_peer_id)
+                .expect("receiver inbound cursor"),
+            0
+        );
+        assert!(
+            store
+                .get_record(&owner, &peer_record.id, "shared")
+                .expect("check rejected peer record")
+                .is_none()
+        );
+        let pending_after = peer
+            .pending_events("compact-replica", 10)
+            .expect("peer event remains queued");
+        assert_eq!(
+            pending_before
+                .iter()
+                .map(|event| event.event_id.as_str())
+                .collect::<Vec<_>>(),
+            pending_after
+                .iter()
+                .map(|event| event.event_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            peer.inbound_cursor("compact-replica")
+                .expect("sender inbound cursor"),
+            0
+        );
+        let receiver_peer_rows_after: i64 = store
+            .lock()
+            .expect("lock compacted store")
+            .query_row(
+                "SELECT COUNT(*) FROM replica_state WHERE peer_replica_id=?",
+                params![stale_peer_id],
+                |row| row.get(0),
+            )
+            .expect("count receiver peer rows after rejection");
+        assert_eq!(receiver_peer_rows_after, receiver_peer_rows_before);
+        drop(peer);
 
         let connection = store.lock().expect("lock compacted store");
         let watermark: i64 = connection

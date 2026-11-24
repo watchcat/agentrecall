@@ -306,6 +306,8 @@ mod tests {
             peer_token: None,
             peer_replica_id: None,
             trusted_replica_id: None,
+            embedding_provider: None,
+            embedding_cache_dir: directory.path().join("models"),
         };
         let cancellation = CancellationToken::new();
         let app = build_app(

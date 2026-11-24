@@ -5,7 +5,7 @@
 
 AgentRecall is a self-hostable shared-memory service for AI agents and applications. It is written in Rust and exposes memory operations over MCP Streamable HTTP, with an embedded DuckDB database owned by each service instance. Clients use the service API; they never open database files directly.
 
-> **Status: prototype.** The earlier 25-test core-service suite passed before the BGE-M3 integration and Rust 1.100 migration. The current provider-enabled application has not completed a full build, and real BGE-M3 inference has not been verified. A standalone smoke binary linked, but fetching the model weights ran out of disk space. The owner plans to build and test locally. Two-node replication acceptance, live Cue/Hermes integration, and production deployment/security checks also remain. See [implementation status and release gates](docs/implementation-status.md).
+> **Status: prototype.** On Rust 1.100.0, `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets` (26 passed), strict Clippy, the release build, and CLI `--help` passed locally. A real local BGE-M3 smoke test initialized the model, saved a Cantonese memory, and retrieved it with an English query. That service run had no VSS extension, so it used exact owner/namespace-scoped vector scoring; it did not exercise HNSW. Two-node replication acceptance, live Cue/Hermes integration, and production deployment/security checks remain. See [implementation status and release gates](docs/implementation-status.md).
 
 ## What it provides
 
@@ -13,7 +13,7 @@ AgentRecall is a self-hostable shared-memory service for AI agents and applicati
 - Per-client bearer credentials, owner and namespace authorization, scoped permissions, origin/host checks, request limits, and rate limiting.
 - Durable records, optimistic revision checks, idempotent saves, tombstones, and signed, filter-bound search cursors.
 - Local-initiated replication between independent database instances, with idempotent event application and explicit retention/resolution of concurrent branches.
-- Lexical search that remains available without optional extensions; DuckDB FTS/BM25 and a tested semantic-search path are implemented. The BGE-M3 provider itself still needs build and inference verification.
+- Lexical search remains available without optional extensions; DuckDB FTS/BM25 and semantic search are implemented. The local BGE-M3 provider smoke passed, using exact scoped-vector fallback because VSS was not installed.
 - An optional loopback-only router for Hermes that prefers the local service and uses the cloud route only under narrowly defined connection-failure conditions.
 
 ## Architecture
@@ -33,7 +33,7 @@ flowchart TB
     Service --> Replication["Replication endpoint<br/>events · cursors · conflict branches"]
 ```
 
-The FTS and VSS indexes are rebuildable search aids. The service explicitly provisions extensions; startup does not download them. The BGE-M3 provider is opt-in through `AGENTRECALL_EMBEDDING_PROVIDER=bge-m3`. First use downloads model weights from Hugging Face to the local cache, while embedding inference runs in process. `.fastembed_cache/` is ignored by Git. The provider-enabled build and real inference remain unverified. Without that setting, search remains lexical. No memory text is sent to an external embedding provider. See [VSS implementation notes](docs/vss-reference.md).
+The FTS and VSS indexes are rebuildable search aids. The service explicitly provisions extensions; startup does not download them. The BGE-M3 provider is opt-in through `AGENTRECALL_EMBEDDING_PROVIDER=bge-m3`. First use downloads model weights from Hugging Face to the local cache, while embedding inference runs in process. The release build passed, and a real local BGE-M3 inference smoke was separately completed. In that smoke, VSS was not installed, so semantic retrieval used exact owner/namespace-scoped vector scoring rather than HNSW. `.fastembed_cache/` is ignored by Git, and the model cache was not published. Without the provider setting, search remains lexical. No memory text is sent to an external embedding provider. See [VSS implementation notes](docs/vss-reference.md).
 
 ## Multi-node topology
 
@@ -56,13 +56,14 @@ Replication is eventual, not a shared-database transaction. Each node owns and w
 
 ## Build and run locally
 
-Requirements: Rust 1.100 or later and a C/C++ toolchain for the bundled DuckDB build. The commands below are the intended verification steps; the full project build has not yet completed with the BGE-M3 dependency. The owner plans to run them locally. The application does not automatically load a `.env` file; export settings through your shell or service manager.
+Requirements: Rust 1.100 or later and a C/C++ toolchain for the bundled DuckDB build. The following checks passed locally with Rust 1.100.0; see [implementation status](docs/implementation-status.md) for the provider smoke details and remaining release gates. The application does not automatically load a `.env` file; export settings through your shell or service manager.
 
 ```sh
 cargo fmt --check
 cargo check --all-targets
 cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
+cargo build --release
 cargo run --release -- --help
 ```
 
@@ -91,7 +92,7 @@ cargo run --release -- install-fts
 cargo run --release -- install-vss
 ```
 
-FTS accelerates lexical retrieval. The semantic search/index path has been tested with a deterministic test embedding adapter; that test does not verify BGE-M3 inference. With a successfully loaded local/in-process provider, AgentRecall can persist model/version-tagged derived vectors and rebuild per-owner/per-namespace HNSW indexes in memory. If VSS is unavailable, semantic retrieval falls back to exact vector scoring scoped before ranking; without an embedding adapter, search remains lexical. Expired and deleted records are removed from derived search projections as part of retrieval and mutation handling.
+FTS accelerates lexical retrieval. The semantic search path is covered by a deterministic test adapter, and actual local BGE-M3 inference was smoke-tested through an isolated service: it saved a Cantonese memory and retrieved it with an English query. VSS was not installed for that run, so retrieval used exact owner/namespace-scoped vector scoring and did not exercise HNSW. With VSS provisioned, AgentRecall can persist model/version-tagged derived vectors and build per-owner/per-namespace HNSW indexes in memory. Without an embedding adapter, search remains lexical. Expired and deleted records are removed from derived search projections as part of retrieval and mutation handling.
 
 The local replica initiates HTTPS exchanges with the cloud endpoint when `AGENTRECALL_PEER_URL`, `AGENTRECALL_PEER_TOKEN`, and `AGENTRECALL_PEER_REPLICA_ID` are configured. Replication credentials are separate from MCP client credentials. Delivery is at-least-once and event application is idempotent. Conflicts require an operator to inspect retained branches and explicitly resolve them; see [operations](docs/operations.md).
 

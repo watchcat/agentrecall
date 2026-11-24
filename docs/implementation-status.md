@@ -1,6 +1,6 @@
 # Implementation status and release gates
 
-This worktree is local and has not been published. The BGE-M3 provider and Rust 1.100 migration are not yet fully verified.
+This update is local and has not been pushed or deployed. The Rust 1.100.0 build/test checks and a real local BGE-M3 inference smoke have passed; VSS/HNSW-backed retrieval and the production release gates below remain unverified.
 
 ## Verified before BGE-M3 integration
 
@@ -18,18 +18,18 @@ Before the BGE-M3 provider and Rust 1.100 migration, the core checks passed: `ca
 
 ## Current BGE-M3 and Rust status
 
-The project now declares Rust 1.100 and includes an opt-in local FastEmbed BGE-M3 (`BGEM3Q`) provider with 1024-dimensional output. The model assets are fetched from Hugging Face on first initialization if not already cached; inference is intended to run locally in process. The provider is selected with `AGENTRECALL_EMBEDDING_PROVIDER=bge-m3`. The owner plans to build and test the project locally before publication.
+Rust 1.100.0 is installed. The following checks passed locally: `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets` (26 passed), `cargo clippy --all-targets --all-features -- -D warnings`, `cargo build --release`, and `cargo run --release -- --help`.
 
-`cargo fmt --check` passed after these changes. A full AgentRecall build did not complete: native DuckDB compilation exhausted workspace disk while archiving objects. No successful `cargo check --all-targets`, test run, or strict Clippy run has been completed after the provider integration and Rust 1.100 migration.
+The 26-test run passed after the optional DuckDB FTS extension was explicitly installed and the HTTP integration-test `Config` fixture was made explicitly provider-disabled (`embedding_provider: None`) with a temporary model-cache directory. Optional extensions are not downloaded automatically at startup.
 
-A standalone BGE-M3 smoke program compiled and linked, but fetching model weights failed for lack of disk space. It did not run inference. The actual model output, integration with the service, and the provider-enabled full test suite are therefore unverified.
+The project includes an opt-in local FastEmbed BGE-M3 (`BGEM3Q`) provider with 1024-dimensional output, selected using `AGENTRECALL_EMBEDDING_PROVIDER=bge-m3`. Model assets are fetched from Hugging Face on first initialization if not already cached; inference runs locally in process. An isolated service smoke initialized the actual model in 42.7 seconds, saved a Cantonese memory, then retrieved it with an English query.
 
-The `.fastembed_cache/` directory is a local model cache and is ignored by Git. Keep model weights out of the repository.
+VSS was not installed for that service run. Semantic retrieval therefore used exact owner/namespace-scoped vector scoring; the provider smoke did not exercise VSS or HNSW. The `.fastembed_cache/` directory is ignored by Git, and the local model cache was not published.
 
 ## Remaining release gates
 
-- Complete `cargo check --all-targets`, `cargo test --all-targets`, and strict Clippy on Rust 1.100 with enough disk space; verify the provider-enabled configuration as well as the default lexical-only configuration.
-- Download the BGE-M3 model weights into the local cache and run an actual multilingual inference smoke test, then exercise semantic save/search/update/delete through the service with that provider. Measure model quality, startup time, throughput, and memory on the intended hardware.
+- Extend BGE-M3 service validation beyond the successful save/search smoke: exercise update/delete and restart behavior, and measure model quality, throughput, and memory on the intended hardware.
+- Install VSS and verify BGE-M3 semantic search using owner/namespace-scoped HNSW, including index creation and rebuild; the real-provider smoke above used exact-vector fallback and did not exercise HNSW.
 - Confirm embedding model/version/dimension compatibility on both replicas before relying on cross-replica semantic retrieval.
 - Validate live Cue and Hermes endpoints, active recall/capture behavior, and cross-client retrieval after deployment.
 - Exercise full cross-replica restart/disconnection recovery, conflicts, read-only/revoked credentials, namespace isolation, oversized/malformed requests, rate limits, client disconnects, token rotation, and redaction.

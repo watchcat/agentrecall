@@ -22,12 +22,59 @@ use crate::{
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
-pub struct MemoryService {
-    store: Store,
-    cursor_secret: Vec<u8>,
+pub struct CursorSigningKeys {
+    current: Vec<u8>,
+    previous: Option<PreviousCursorKey>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone)]
+struct PreviousCursorKey {
+    secret: Vec<u8>,
+    valid_until: i64,
+}
+
+impl CursorSigningKeys {
+    pub fn current_only(current: Vec<u8>) -> Self {
+        Self {
+            current,
+            previous: None,
+        }
+    }
+
+    pub fn with_previous(current: Vec<u8>, previous: Vec<u8>, valid_until: i64) -> Self {
+        Self {
+            current,
+            previous: Some(PreviousCursorKey {
+                secret: previous,
+                valid_until,
+            }),
+        }
+    }
+}
+
+impl std::fmt::Debug for CursorSigningKeys {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CursorSigningKeys")
+            .field("current", &"[REDACTED]")
+            .field("previous_configured", &self.previous.is_some())
+            .finish()
+    }
+}
+
+impl From<Vec<u8>> for CursorSigningKeys {
+    fn from(current: Vec<u8>) -> Self {
+        Self::current_only(current)
+    }
+}
+
+#[derive(Clone)]
+pub struct MemoryService {
+    store: Store,
+    cursor_keys: CursorSigningKeys,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CursorPayload {
     owner_id: String,
     client_id: String,
@@ -38,10 +85,10 @@ struct CursorPayload {
 }
 
 impl MemoryService {
-    pub fn new(store: Store, cursor_secret: Vec<u8>) -> Self {
+    pub fn new(store: Store, cursor_keys: impl Into<CursorSigningKeys>) -> Self {
         Self {
             store,
-            cursor_secret,
+            cursor_keys: cursor_keys.into(),
         }
     }
 
@@ -52,11 +99,11 @@ impl MemoryService {
     /// Configure a service with an explicitly selected local/in-process embedding provider.
     pub fn with_embedding_provider(
         store: Store,
-        cursor_secret: Vec<u8>,
+        cursor_keys: impl Into<CursorSigningKeys>,
         provider: Arc<dyn EmbeddingProvider>,
     ) -> Result<Self, AppError> {
         store.configure_embeddings(provider)?;
-        Ok(Self::new(store, cursor_secret))
+        Ok(Self::new(store, cursor_keys))
     }
 
     pub fn search(&self, auth: &AuthContext, input: SearchInput) -> Result<SearchOutput, AppError> {
@@ -290,7 +337,7 @@ impl MemoryService {
 
     fn encode_cursor(&self, payload: CursorPayload) -> Result<String, AppError> {
         let json = serde_json::to_vec(&payload).map_err(|_| AppError::TemporarilyUnavailable)?;
-        let mut mac = HmacSha256::new_from_slice(&self.cursor_secret)
+        let mut mac = HmacSha256::new_from_slice(&self.cursor_keys.current)
             .map_err(|_| AppError::TemporarilyUnavailable)?;
         mac.update(&json);
         let signature = mac.finalize().into_bytes();
@@ -302,6 +349,10 @@ impl MemoryService {
     }
 
     fn decode_cursor(&self, cursor: &str) -> Result<CursorPayload, AppError> {
+        self.decode_cursor_at(cursor, Utc::now().timestamp())
+    }
+
+    fn decode_cursor_at(&self, cursor: &str, now: i64) -> Result<CursorPayload, AppError> {
         let (encoded, signature) = cursor
             .split_once('.')
             .ok_or_else(|| invalid("cursor", "cursor is malformed"))?;
@@ -311,13 +362,31 @@ impl MemoryService {
         let signature = URL_SAFE_NO_PAD
             .decode(signature)
             .map_err(|_| invalid("cursor", "cursor is malformed"))?;
-        let mut mac = HmacSha256::new_from_slice(&self.cursor_secret)
-            .map_err(|_| AppError::TemporarilyUnavailable)?;
-        mac.update(&json);
-        mac.verify_slice(&signature)
-            .map_err(|_| invalid("cursor", "cursor signature is invalid"))?;
+        let current_valid = verify_cursor_signature(&self.cursor_keys.current, &json, &signature)?;
+        let previous_valid = if current_valid {
+            false
+        } else if let Some(previous) = self
+            .cursor_keys
+            .previous
+            .as_ref()
+            .filter(|previous| now < previous.valid_until)
+        {
+            verify_cursor_signature(&previous.secret, &json, &signature)?
+        } else {
+            false
+        };
+        if !current_valid && !previous_valid {
+            return Err(invalid("cursor", "cursor signature is invalid"));
+        }
         serde_json::from_slice(&json).map_err(|_| invalid("cursor", "cursor is malformed"))
     }
+}
+
+fn verify_cursor_signature(secret: &[u8], json: &[u8], signature: &[u8]) -> Result<bool, AppError> {
+    let mut mac =
+        HmacSha256::new_from_slice(secret).map_err(|_| AppError::TemporarilyUnavailable)?;
+    mac.update(json);
+    Ok(mac.verify_slice(signature).is_ok())
 }
 
 fn require_scope(auth: &AuthContext, scope: &str) -> Result<(), AppError> {
@@ -366,6 +435,87 @@ mod tests {
             allowed_namespaces: HashSet::from(["shared".into()]),
             token_fingerprint: "hash".into(),
         }
+    }
+
+    fn cursor_payload() -> CursorPayload {
+        CursorPayload {
+            owner_id: "owner".into(),
+            client_id: "cue".into(),
+            namespace: "shared".into(),
+            filter_digest: "filter".into(),
+            offset: 8,
+            expires_at: i64::MAX,
+        }
+    }
+
+    #[test]
+    fn cursor_rotation_accepts_old_and_new_signatures_during_grace() {
+        let dir = tempdir().expect("temp dir");
+        let store = Store::open(&dir.path().join("db.duckdb"), "replica", 100).expect("store");
+        let old_service = MemoryService::new(store.clone(), vec![1; 32]);
+        let deadline = Utc::now().timestamp() + 3600;
+        let rotating_service = MemoryService::new(
+            store,
+            CursorSigningKeys::with_previous(vec![2; 32], vec![1; 32], deadline),
+        );
+        let old_cursor = old_service
+            .encode_cursor(cursor_payload())
+            .expect("old cursor");
+        let new_cursor = rotating_service
+            .encode_cursor(cursor_payload())
+            .expect("new cursor");
+
+        assert!(
+            rotating_service
+                .decode_cursor_at(&old_cursor, deadline - 1)
+                .is_ok()
+        );
+        assert!(
+            rotating_service
+                .decode_cursor_at(&new_cursor, deadline - 1)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn previous_cursor_key_expires_and_is_removed_without_affecting_current_key() {
+        let dir = tempdir().expect("temp dir");
+        let store = Store::open(&dir.path().join("db.duckdb"), "replica", 100).expect("store");
+        let old_service = MemoryService::new(store.clone(), vec![1; 32]);
+        let deadline = Utc::now().timestamp() + 3600;
+        let rotating_service = MemoryService::new(
+            store.clone(),
+            CursorSigningKeys::with_previous(vec![2; 32], vec![1; 32], deadline),
+        );
+        let old_cursor = old_service
+            .encode_cursor(cursor_payload())
+            .expect("old cursor");
+        let new_cursor = rotating_service
+            .encode_cursor(cursor_payload())
+            .expect("new cursor");
+
+        assert!(
+            rotating_service
+                .decode_cursor_at(&old_cursor, deadline)
+                .is_err()
+        );
+        assert!(
+            rotating_service
+                .decode_cursor_at(&new_cursor, deadline)
+                .is_ok()
+        );
+
+        let after_removal = MemoryService::new(store, vec![2; 32]);
+        assert!(
+            after_removal
+                .decode_cursor_at(&old_cursor, deadline - 1)
+                .is_err()
+        );
+        assert!(
+            after_removal
+                .decode_cursor_at(&new_cursor, deadline - 1)
+                .is_ok()
+        );
     }
 
     #[test]

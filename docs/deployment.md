@@ -15,6 +15,9 @@ AGENTRECALL_REPLICA_ID=cloud-<stable-id>
 AGENTRECALL_ALLOWED_HOSTS=memory.example.net
 AGENTRECALL_ALLOWED_ORIGINS=https://<approved-client-origin>
 AGENTRECALL_CURSOR_HMAC_SECRET=<at-least-32-random-bytes>
+# During rotation only; configure both together. Deadline must be RFC 3339.
+# AGENTRECALL_CURSOR_HMAC_PREVIOUS_SECRET=<previous-cursor-secret>
+# AGENTRECALL_CURSOR_HMAC_PREVIOUS_UNTIL=<RFC3339-UTC-deadline>
 AGENTRECALL_REPLICATION_TOKEN=<cloud-accepts-local-replication-token>
 AGENTRECALL_TRUSTED_REPLICA_ID=local-<stable-id>
 ```
@@ -36,6 +39,9 @@ AGENTRECALL_PEER_URL=https://memory.example.net/_internal/replication/exchange
 AGENTRECALL_PEER_TOKEN=<credential-accepted-by-cloud-replication-endpoint>
 AGENTRECALL_PEER_REPLICA_ID=cloud-<stable-id>
 AGENTRECALL_CURSOR_HMAC_SECRET=<at-least-32-random-bytes>
+# During rotation only; configure both together. Deadline must be RFC 3339.
+# AGENTRECALL_CURSOR_HMAC_PREVIOUS_SECRET=<previous-cursor-secret>
+# AGENTRECALL_CURSOR_HMAC_PREVIOUS_UNTIL=<RFC3339-UTC-deadline>
 ```
 
 The cloud side sets `AGENTRECALL_REPLICATION_TOKEN` to the credential sent by the local service and `AGENTRECALL_TRUSTED_REPLICA_ID` to that local service's stable ID. The service rejects an authenticated exchange if its declared source ID differs from this trusted ID. The token is separate from Cue/Hermes client tokens. Use different secrets from MCP credentials, rotate them deliberately, and never place them in MCP tool arguments. `AGENTRECALL_REPLICA_ID` must remain stable for the life of a database file; if omitted at first startup, the service creates and persists one, which is returned in readiness metadata. Obtain each replica ID from its operator/deployment configuration, not from a client-supplied argument.

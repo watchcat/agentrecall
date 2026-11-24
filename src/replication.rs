@@ -128,6 +128,7 @@ async fn sync_once(
     let response: SyncResponse = response.json().await?;
     store.acknowledge_outbound(peer_replica_id, response.accepted_through)?;
     store.apply_remote_events(peer_replica_id, &response.events)?;
+    store.record_successful_sync()?;
     Ok(())
 }
 

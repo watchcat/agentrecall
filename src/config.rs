@@ -1,7 +1,12 @@
 use std::{env, net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, bail};
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
+
+use crate::memory_service::CursorSigningKeys;
+
+const MAX_CURSOR_PREVIOUS_GRACE_SECONDS: i64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -12,7 +17,7 @@ pub struct Config {
     pub role: String,
     pub allowed_hosts: Vec<String>,
     pub allowed_origins: Vec<String>,
-    pub cursor_secret: Vec<u8>,
+    pub cursor_keys: CursorSigningKeys,
     pub quota_per_owner: i64,
     pub replication_token: Option<String>,
     pub peer_url: Option<String>,
@@ -65,19 +70,12 @@ impl Config {
         if quota_per_owner < 1 {
             bail!("AGENTRECALL_QUOTA_PER_OWNER must be positive");
         }
-        let cursor_secret = match env::var("AGENTRECALL_CURSOR_HMAC_SECRET") {
-            Ok(secret) if secret.len() >= 32 => secret.into_bytes(),
-            Ok(_) => bail!("AGENTRECALL_CURSOR_HMAC_SECRET must contain at least 32 bytes"),
-            Err(_) => {
-                tracing::warn!(
-                    "AGENTRECALL_CURSOR_HMAC_SECRET is unset; pagination cursors will not survive a restart"
-                );
-                let mut bytes = Vec::with_capacity(32);
-                bytes.extend_from_slice(Uuid::new_v4().as_bytes());
-                bytes.extend_from_slice(Uuid::new_v4().as_bytes());
-                bytes
-            }
-        };
+        let cursor_keys = parse_cursor_signing_keys(
+            env::var("AGENTRECALL_CURSOR_HMAC_SECRET").ok(),
+            env::var("AGENTRECALL_CURSOR_HMAC_PREVIOUS_SECRET").ok(),
+            env::var("AGENTRECALL_CURSOR_HMAC_PREVIOUS_UNTIL").ok(),
+            Utc::now().timestamp(),
+        )?;
 
         let replication_token = env::var("AGENTRECALL_REPLICATION_TOKEN").ok();
         let peer_url = env::var("AGENTRECALL_PEER_URL").ok();
@@ -147,7 +145,7 @@ impl Config {
             role,
             allowed_hosts,
             allowed_origins,
-            cursor_secret,
+            cursor_keys,
             quota_per_owner,
             replication_token,
             peer_url,
@@ -157,5 +155,127 @@ impl Config {
             embedding_provider,
             embedding_cache_dir,
         })
+    }
+}
+
+fn parse_cursor_signing_keys(
+    current: Option<String>,
+    previous: Option<String>,
+    previous_until: Option<String>,
+    now: i64,
+) -> anyhow::Result<CursorSigningKeys> {
+    if previous.is_some() != previous_until.is_some() {
+        bail!(
+            "AGENTRECALL_CURSOR_HMAC_PREVIOUS_SECRET and AGENTRECALL_CURSOR_HMAC_PREVIOUS_UNTIL must be configured together"
+        );
+    }
+    if previous.is_some() && current.is_none() {
+        bail!(
+            "AGENTRECALL_CURSOR_HMAC_SECRET must be explicitly configured while a previous cursor key is active"
+        );
+    }
+
+    let current = match current {
+        Some(secret) if secret.len() >= 32 => secret.into_bytes(),
+        Some(_) => bail!("AGENTRECALL_CURSOR_HMAC_SECRET must contain at least 32 bytes"),
+        None => {
+            tracing::warn!(
+                "AGENTRECALL_CURSOR_HMAC_SECRET is unset; pagination cursors will not survive a restart"
+            );
+            let mut bytes = Vec::with_capacity(32);
+            bytes.extend_from_slice(Uuid::new_v4().as_bytes());
+            bytes.extend_from_slice(Uuid::new_v4().as_bytes());
+            bytes
+        }
+    };
+
+    match (previous, previous_until) {
+        (Some(previous), Some(until)) => {
+            if previous.len() < 32 {
+                bail!("AGENTRECALL_CURSOR_HMAC_PREVIOUS_SECRET must contain at least 32 bytes");
+            }
+            let valid_until = DateTime::parse_from_rfc3339(&until)
+                .context("AGENTRECALL_CURSOR_HMAC_PREVIOUS_UNTIL must be RFC 3339")?
+                .timestamp();
+            if previous.as_bytes() == current.as_slice() {
+                bail!(
+                    "AGENTRECALL_CURSOR_HMAC_SECRET and AGENTRECALL_CURSOR_HMAC_PREVIOUS_SECRET must differ"
+                );
+            }
+            if valid_until > now.saturating_add(MAX_CURSOR_PREVIOUS_GRACE_SECONDS) {
+                bail!(
+                    "AGENTRECALL_CURSOR_HMAC_PREVIOUS_UNTIL must be no more than 24 hours in the future"
+                );
+            }
+            if valid_until <= now {
+                tracing::info!("previous cursor-signing key has expired and was discarded");
+                Ok(CursorSigningKeys::current_only(current))
+            } else {
+                Ok(CursorSigningKeys::with_previous(
+                    current,
+                    previous.into_bytes(),
+                    valid_until,
+                ))
+            }
+        }
+        (None, None) => Ok(CursorSigningKeys::current_only(current)),
+        _ => unreachable!("paired previous cursor settings were validated above"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn previous_cursor_settings_require_a_pair_and_an_explicit_current_key() {
+        let current = "c".repeat(32);
+        let previous = "p".repeat(32);
+        let deadline = "1970-01-01T00:01:00Z".to_owned();
+
+        assert!(
+            parse_cursor_signing_keys(Some(current.clone()), None, Some(deadline.clone()), 0,)
+                .is_err()
+        );
+        assert!(
+            parse_cursor_signing_keys(Some(current.clone()), Some(previous.clone()), None, 0,)
+                .is_err()
+        );
+        assert!(parse_cursor_signing_keys(None, Some(previous), Some(deadline), 0).is_err());
+    }
+
+    #[test]
+    fn previous_cursor_key_must_be_long_distinct_and_within_grace_limit() {
+        let current = "c".repeat(32);
+        let previous = "p".repeat(32);
+        let deadline = "1970-01-01T00:01:00Z".to_owned();
+
+        assert!(
+            parse_cursor_signing_keys(
+                Some(current.clone()),
+                Some("short".to_owned()),
+                Some(deadline.clone()),
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_cursor_signing_keys(
+                Some(current.clone()),
+                Some(current.clone()),
+                Some(deadline),
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_cursor_signing_keys(
+                Some(current),
+                Some(previous),
+                Some("1970-01-02T00:00:01Z".to_owned()),
+                0,
+            )
+            .is_err()
+        );
     }
 }

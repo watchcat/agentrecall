@@ -1,11 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     path::Path,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -116,12 +117,101 @@ pub struct Store {
     semantic_ready: Arc<AtomicBool>,
     embedding_provider: Arc<Mutex<Option<Arc<dyn EmbeddingProvider>>>>,
     embedding_model: Arc<Mutex<Option<EmbeddingModel>>>,
+    operational_metrics: Arc<OperationalMetrics>,
     quota_per_owner: i64,
 }
 
 const SEMANTIC_INDEX_MEMORY_BUDGET: usize = 128 * 1024 * 1024;
 const VSS_CANDIDATE_LIMIT: usize = 256;
 const MIN_SEMANTIC_COSINE_SIMILARITY: f32 = 0.15;
+const SEARCH_LATENCY_WINDOW: Duration = Duration::from_secs(300);
+const SEARCH_LATENCY_MAX_SAMPLES: usize = 2048;
+
+#[derive(Default)]
+struct OperationalMetrics {
+    search_latencies_ns: Mutex<VecDeque<(Instant, u64)>>,
+    hnsw_search_attempts: AtomicU64,
+    hnsw_exact_fallbacks: AtomicU64,
+}
+
+impl OperationalMetrics {
+    fn record_search_latency(&self, elapsed: Duration) {
+        let Ok(mut samples) = self.search_latencies_ns.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        samples.retain(|(recorded_at, _)| now.duration_since(*recorded_at) < SEARCH_LATENCY_WINDOW);
+        samples.push_back((now, elapsed.as_nanos().min(u64::MAX as u128) as u64));
+        while samples.len() > SEARCH_LATENCY_MAX_SAMPLES {
+            samples.pop_front();
+        }
+    }
+
+    fn search_latency_p95_seconds(&self) -> Option<f64> {
+        let Ok(mut samples) = self.search_latencies_ns.lock() else {
+            return None;
+        };
+        let now = Instant::now();
+        samples.retain(|(recorded_at, _)| now.duration_since(*recorded_at) < SEARCH_LATENCY_WINDOW);
+        let mut latencies = samples.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+        if latencies.is_empty() {
+            return None;
+        }
+        latencies.sort_unstable();
+        let index = (latencies.len() * 95).div_ceil(100).saturating_sub(1);
+        Some(latencies[index] as f64 / 1_000_000_000.0)
+    }
+
+    fn search_latency_sample_count(&self) -> usize {
+        let Ok(mut samples) = self.search_latencies_ns.lock() else {
+            return 0;
+        };
+        let now = Instant::now();
+        samples.retain(|(recorded_at, _)| now.duration_since(*recorded_at) < SEARCH_LATENCY_WINDOW);
+        samples.len()
+    }
+
+    fn hnsw_fallback_rate(&self) -> f64 {
+        let attempts = self.hnsw_search_attempts.load(Ordering::Relaxed);
+        if attempts == 0 {
+            0.0
+        } else {
+            self.hnsw_exact_fallbacks
+                .load(Ordering::Relaxed)
+                .min(attempts) as f64
+                / attempts as f64
+        }
+    }
+}
+
+struct SearchLatencyGuard {
+    metrics: Arc<OperationalMetrics>,
+    started_at: Instant,
+}
+
+impl Drop for SearchLatencyGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .record_search_latency(self.started_at.elapsed());
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OperationalSnapshot {
+    pub search_p95_latency_seconds: f64,
+    pub search_latency_samples: usize,
+    pub hnsw_search_attempts: u64,
+    pub hnsw_exact_fallbacks: u64,
+    pub hnsw_exact_fallback_rate: f64,
+    pub hnsw_index_estimated_bytes: usize,
+    pub hnsw_index_budget_bytes: usize,
+    pub hnsw_active: bool,
+    pub replication_queue_depth: i64,
+    pub replication_lag_events: i64,
+    pub replication_lag_seconds: i64,
+    pub last_successful_sync_at: Option<String>,
+    pub unresolved_conflicts: i64,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct SearchPage {
@@ -225,6 +315,7 @@ impl Store {
             semantic_ready: Arc::new(AtomicBool::new(false)),
             embedding_provider: Arc::new(Mutex::new(None)),
             embedding_model: Arc::new(Mutex::new(None)),
+            operational_metrics: Arc::new(OperationalMetrics::default()),
             quota_per_owner,
         };
         if fts_available {
@@ -271,6 +362,161 @@ impl Store {
         } else {
             "exact_scoped_vector_scan"
         }
+    }
+
+    pub fn operational_snapshot(
+        &self,
+        peer_replica_id: Option<&str>,
+    ) -> Result<OperationalSnapshot, AppError> {
+        let connection = self.lock()?;
+        let unresolved_conflicts = connection
+            .query_row("SELECT COUNT(*) FROM replication_conflicts", [], |row| {
+                row.get(0)
+            })
+            .map_err(storage_error)?;
+        let last_successful_sync_at = connection
+            .query_row(
+                "SELECT value FROM service_meta WHERE key='last_successful_sync_at'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_error)?;
+        let (replication_queue_depth, replication_lag_events, replication_lag_seconds) =
+            if let Some(peer_replica_id) = peer_replica_id {
+                let acknowledged = connection
+                    .query_row(
+                        "SELECT outbound_ack FROM replica_state WHERE peer_replica_id=?",
+                        params![peer_replica_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(storage_error)?
+                    .unwrap_or(0);
+                let queue_depth = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM mutation_log WHERE origin_replica_id=? AND origin_seq>?",
+                        params![self.replica_id(), acknowledged],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(storage_error)?;
+                let local_sequence = connection
+                    .query_row(
+                        "SELECT CAST(value AS BIGINT) FROM service_meta WHERE key='local_sequence'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(storage_error)?
+                    .unwrap_or(0);
+                let oldest_unacknowledged = connection
+                    .query_row(
+                        "SELECT created_at FROM mutation_log WHERE origin_replica_id=? AND origin_seq>? ORDER BY origin_seq LIMIT 1",
+                        params![self.replica_id(), acknowledged],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(storage_error)?;
+                let lag_seconds = oldest_unacknowledged
+                    .and_then(|timestamp| DateTime::parse_from_rfc3339(&timestamp).ok())
+                    .map(|timestamp| {
+                        Utc::now()
+                            .signed_duration_since(timestamp.with_timezone(&Utc))
+                            .num_seconds()
+                            .max(0)
+                    })
+                    .unwrap_or(0);
+                (
+                    queue_depth,
+                    local_sequence.saturating_sub(acknowledged).max(0),
+                    lag_seconds,
+                )
+            } else {
+                (0, 0, 0)
+            };
+        drop(connection);
+
+        let hnsw_active = self.semantic_ready() && self.vss_available();
+        let hnsw_index_estimated_bytes = self.estimate_hnsw_index_bytes()?;
+        let search_p95_latency_seconds = self
+            .operational_metrics
+            .search_latency_p95_seconds()
+            .unwrap_or(0.0);
+        let search_latency_samples = self.operational_metrics.search_latency_sample_count();
+        Ok(OperationalSnapshot {
+            search_p95_latency_seconds,
+            search_latency_samples,
+            hnsw_search_attempts: self
+                .operational_metrics
+                .hnsw_search_attempts
+                .load(Ordering::Relaxed),
+            hnsw_exact_fallbacks: self
+                .operational_metrics
+                .hnsw_exact_fallbacks
+                .load(Ordering::Relaxed),
+            hnsw_exact_fallback_rate: self.operational_metrics.hnsw_fallback_rate(),
+            hnsw_index_estimated_bytes,
+            hnsw_index_budget_bytes: SEMANTIC_INDEX_MEMORY_BUDGET,
+            hnsw_active,
+            replication_queue_depth,
+            replication_lag_events,
+            replication_lag_seconds,
+            last_successful_sync_at,
+            unresolved_conflicts,
+        })
+    }
+
+    fn estimate_hnsw_index_bytes(&self) -> Result<usize, AppError> {
+        let dimension = self
+            .embedding_model
+            .lock()
+            .map_err(|_| AppError::TemporarilyUnavailable)?
+            .as_ref()
+            .map(|model| model.dimension)
+            .unwrap_or(0);
+        if dimension == 0 {
+            return Ok(0);
+        }
+        let vector_connection = self
+            .vector_connection
+            .lock()
+            .map_err(|_| AppError::TemporarilyUnavailable)?;
+        let mut statement = vector_connection
+            .prepare("SELECT table_name FROM information_schema.tables WHERE table_name LIKE 'vss_scope_%'")
+            .map_err(storage_error)?;
+        let tables = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(storage_error)?
+            .collect::<duckdb::Result<Vec<_>>>()
+            .map_err(storage_error)?;
+        drop(statement);
+        let mut vector_count = 0usize;
+        for table in tables {
+            let Some(suffix) = table.strip_prefix("vss_scope_") else {
+                continue;
+            };
+            if suffix.len() != 64 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            let count = vector_connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .map_err(storage_error)?;
+            vector_count = vector_count.saturating_add(usize::try_from(count).unwrap_or(0));
+        }
+        Ok(vector_count.saturating_mul(dimension).saturating_mul(12))
+    }
+
+    pub fn record_successful_sync(&self) -> Result<(), AppError> {
+        let connection = self.lock()?;
+        connection
+            .execute(
+                "INSERT INTO service_meta(key,value) VALUES ('last_successful_sync_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![now_rfc3339()],
+            )
+            .map_err(storage_error)?;
+        Ok(())
     }
 
     /// Enable semantic search with an explicitly supplied local/in-process adapter.
@@ -884,6 +1130,10 @@ impl Store {
         &self,
         request: SearchRequest<'_>,
     ) -> Result<SearchOutput, AppError> {
+        let _latency_guard = SearchLatencyGuard {
+            metrics: self.operational_metrics.clone(),
+            started_at: Instant::now(),
+        };
         let SearchRequest {
             auth,
             namespace,
@@ -1065,6 +1315,9 @@ impl Store {
             )
             .ok()?;
         if self.vss_available() {
+            self.operational_metrics
+                .hnsw_search_attempts
+                .fetch_add(1, Ordering::Relaxed);
             let table = vector_scope_table(owner_id, namespace);
             if let Ok(vector_connection) = self.vector_connection.lock() {
                 let projection_count = vector_connection
@@ -1085,6 +1338,9 @@ impl Store {
                     self.vss_available.store(false, Ordering::Relaxed);
                 }
             }
+            self.operational_metrics
+                .hnsw_exact_fallbacks
+                .fetch_add(1, Ordering::Relaxed);
         }
         exact_vector_scores(connection, owner_id, namespace, &model, query_vector).ok()
     }
@@ -1372,6 +1628,7 @@ impl Store {
         Ok(cursor)
     }
 
+    #[cfg(test)]
     pub fn conflict_count(&self) -> Result<i64, AppError> {
         let connection = self.lock()?;
         connection
@@ -2243,6 +2500,19 @@ mod tests {
         assert_eq!(history, 0);
     }
 
+    #[test]
+    fn rolling_search_latency_and_hnsw_fallback_metrics_are_calculated() {
+        let metrics = OperationalMetrics::default();
+        for millis in [1, 2, 3, 4, 5] {
+            metrics.record_search_latency(Duration::from_millis(millis));
+        }
+        metrics.hnsw_search_attempts.store(4, Ordering::Relaxed);
+        metrics.hnsw_exact_fallbacks.store(1, Ordering::Relaxed);
+        assert_eq!(metrics.search_latency_sample_count(), 5);
+        assert_eq!(metrics.search_latency_p95_seconds(), Some(0.005));
+        assert_eq!(metrics.hnsw_fallback_rate(), 0.25);
+    }
+
     fn auth(owner: &str, client: &str) -> AuthContext {
         AuthContext {
             owner_id: owner.into(),
@@ -2276,6 +2546,46 @@ mod tests {
             deleted_at: None,
             version_event_id: None,
         }
+    }
+
+    #[test]
+    fn operational_snapshot_reports_queue_lag_and_persisted_sync_time() {
+        let directory = tempdir().expect("temporary directory");
+        let database = directory.path().join("metrics.duckdb");
+        let store = Store::open(&database, "metrics-replica", 100).expect("open store");
+        store
+            .save_record(&auth("owner-a", "cue"), record("queued event"), None, "")
+            .expect("save local event");
+
+        let pending = store
+            .operational_snapshot(Some("peer-replica"))
+            .expect("pending metrics");
+        assert_eq!(pending.replication_queue_depth, 1);
+        assert_eq!(pending.replication_lag_events, 1);
+        assert!(pending.replication_lag_seconds >= 0);
+
+        store
+            .acknowledge_outbound("peer-replica", 1)
+            .expect("acknowledge event");
+        store
+            .record_successful_sync()
+            .expect("record successful sync");
+        let synchronized = store
+            .operational_snapshot(Some("peer-replica"))
+            .expect("synchronized metrics");
+        assert_eq!(synchronized.replication_queue_depth, 0);
+        assert_eq!(synchronized.replication_lag_events, 0);
+        assert!(synchronized.last_successful_sync_at.is_some());
+        drop(store);
+
+        let reopened = Store::open(&database, "metrics-replica", 100).expect("reopen store");
+        assert!(
+            reopened
+                .operational_snapshot(Some("peer-replica"))
+                .expect("reopened metrics")
+                .last_successful_sync_at
+                .is_some()
+        );
     }
 
     #[test]
@@ -2434,6 +2744,41 @@ mod tests {
             Some("semantic vector similarity")
         );
         assert_eq!(store.search_engine(), "exact_scoped_vector_scan");
+
+        store.vss_available.store(true, Ordering::Relaxed);
+        {
+            let vector_connection = store
+                .vector_connection
+                .lock()
+                .expect("lock vector projection");
+            vector_connection
+                .execute_batch(&format!(
+                    "INSERT INTO {vector_table} VALUES ('projection-orphan', [0.0, 1.0, 0.0]);"
+                ))
+                .expect("add mismatched projection row");
+        }
+        let fallback_result = store
+            .search_records_semantic(SearchRequest {
+                auth: &owner,
+                namespace: "shared",
+                query: "avian",
+                kinds: None,
+                tags_any: None,
+                query_embedding: Some(&query_embedding),
+                page: SearchPage {
+                    offset: 0,
+                    limit: 8,
+                },
+            })
+            .expect("exact fallback after HNSW projection mismatch");
+        assert_eq!(fallback_result.results[0].memory.id, saved.id);
+        let metrics = store
+            .operational_snapshot(None)
+            .expect("read semantic-search metrics");
+        assert_eq!(metrics.hnsw_search_attempts, 1);
+        assert_eq!(metrics.hnsw_exact_fallbacks, 1);
+        assert_eq!(metrics.hnsw_exact_fallback_rate, 1.0);
+        assert_eq!(metrics.hnsw_index_estimated_bytes, 2 * 3 * 12);
 
         let connection = store.lock().expect("lock store after expiry purge");
         let persisted_count: i64 = connection

@@ -2,7 +2,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -126,6 +129,7 @@ pub fn hash_token(token: &str) -> String {
 pub struct RateLimiter {
     buckets: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
     max_per_minute: usize,
+    rejections: Arc<AtomicU64>,
 }
 
 impl RateLimiter {
@@ -133,11 +137,13 @@ impl RateLimiter {
         Self {
             buckets: Arc::new(Mutex::new(HashMap::new())),
             max_per_minute,
+            rejections: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn allow(&self, key: &str) -> bool {
         let Ok(mut buckets) = self.buckets.lock() else {
+            self.rejections.fetch_add(1, Ordering::Relaxed);
             return false;
         };
         let bucket = buckets.entry(key.to_owned()).or_default();
@@ -149,10 +155,15 @@ impl RateLimiter {
             bucket.pop_front();
         }
         if bucket.len() >= self.max_per_minute {
+            self.rejections.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         bucket.push_back(now);
         true
+    }
+
+    pub fn rejections_total(&self) -> u64 {
+        self.rejections.load(Ordering::Relaxed)
     }
 }
 
@@ -199,5 +210,15 @@ mod tests {
             auth.authenticate(&HeaderMap::new()),
             Err(AuthFailure::Unauthorized)
         ));
+    }
+
+    #[test]
+    fn rate_limiter_counts_rejections_without_exposing_client_keys() {
+        let limiter = RateLimiter::new(1);
+        assert!(limiter.allow("fingerprint-a"));
+        assert!(!limiter.allow("fingerprint-a"));
+        assert_eq!(limiter.rejections_total(), 1);
+        assert!(limiter.allow("fingerprint-b"));
+        assert_eq!(limiter.rejections_total(), 1);
     }
 }

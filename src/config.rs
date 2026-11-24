@@ -31,7 +31,7 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let bind = env::var("AGENTRECALL_BIND_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:8787".to_owned())
+            .unwrap_or_else(|_| "127.0.0.1:8789".to_owned())
             .parse::<SocketAddr>()
             .context("AGENTRECALL_BIND_ADDR must be a socket address")?;
         let db_path = PathBuf::from(

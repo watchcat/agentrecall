@@ -8,7 +8,7 @@ Example environment (replace placeholders using a secret manager):
 
 ```sh
 AGENTRECALL_ROLE=cloud
-AGENTRECALL_BIND_ADDR=127.0.0.1:8787
+AGENTRECALL_BIND_ADDR=127.0.0.1:8789
 AGENTRECALL_DATABASE_PATH=/var/lib/agentrecall/cloud.duckdb
 AGENTRECALL_TOKENS_FILE=/etc/agentrecall/tokens.json
 AGENTRECALL_REPLICA_ID=cloud-<stable-id>
@@ -26,7 +26,7 @@ Provision a distinct Cue bearer credential in the cloud token file. Do not use t
 
 ## TLS termination and certificate verification
 
-Keep `AGENTRECALL_BIND_ADDR=127.0.0.1:8787` on the cloud host. Terminate public TLS on a reverse proxy running on that same host, expose only TCP 443, and block external access to port 8787. [The Caddy example](../examples/deployment/Caddyfile) obtains and renews a publicly trusted certificate for `memory.example.net`, forwards only `/mcp` and `/_internal/replication/exchange`, and limits `/health/*` and `/metrics` to a monitoring source CIDR. Replace the example hostname and `203.0.113.10/32` with the actual hostname and source address as Caddy sees it. Caddy's reverse proxy passes request headers through and supports streaming; retain `Authorization`, `Origin`, `Accept`, `Content-Type`, and `MCP-Protocol-Version` if adapting the example to another proxy. Do not expose operator CLI paths.
+Keep `AGENTRECALL_BIND_ADDR=127.0.0.1:8789` on the cloud host. Terminate public TLS on a reverse proxy running on that same host, expose only TCP 443, and block external access to port 8789. [The Caddy example](../examples/deployment/Caddyfile) obtains and renews a publicly trusted certificate for `memory.example.net`, forwards only `/mcp` and `/_internal/replication/exchange`, and limits `/health/*` and `/metrics` to a monitoring source CIDR. Replace the example hostname and `203.0.113.10/32` with the actual hostname and source address as Caddy sees it. Caddy's reverse proxy passes request headers through and supports streaming; retain `Authorization`, `Origin`, `Accept`, `Content-Type`, and `MCP-Protocol-Version` if adapting the example to another proxy. Do not expose operator CLI paths.
 
 Cue and the Hermes router's cloud hop must use `https://memory.example.net/mcp` and validate the certificate chain and hostname. The local replica's `AGENTRECALL_PEER_URL` accepts HTTPS only; its Reqwest/Rustls client retains normal CA and hostname verification, rejects plaintext HTTP, and does not follow redirects. Keep a complete, unexpired certificate chain whose SAN matches the peer hostname. The client bearer token is separate from TLS and does not replace certificate verification. Never use an insecure certificate-verification option or a self-signed leaf certificate. This deployment uses a public CA; the service does not expose a custom CA-bundle setting.
 
@@ -45,7 +45,7 @@ Run a separate local service process with its own DuckDB path and Hermes client 
 
 ```sh
 AGENTRECALL_ROLE=local
-AGENTRECALL_BIND_ADDR=127.0.0.1:8787
+AGENTRECALL_BIND_ADDR=127.0.0.1:8789
 AGENTRECALL_DATABASE_PATH=$HOME/.local/share/agentrecall/local.duckdb
 AGENTRECALL_TOKENS_FILE=$HOME/.config/agentrecall/tokens.json
 AGENTRECALL_REPLICA_ID=local-<stable-id>
@@ -75,14 +75,15 @@ On the Hermes machine, run `agentrecall serve-router`. It is loopback-only and d
 
 ```sh
 AGENTRECALL_ROUTER_BIND_ADDR=127.0.0.1:8788
-AGENTRECALL_ROUTER_LOCAL_URL=http://127.0.0.1:8787/mcp
-AGENTRECALL_ROUTER_CLOUD_URL=https://memory.example.net/mcp
+AGENTRECALL_ROUTER_LOCAL_URL=http://127.0.0.1:8789/mcp
+# Optional cloud fallback; omit both cloud variables for local-only mode.
+# AGENTRECALL_ROUTER_CLOUD_URL=https://memory.example.net/mcp
 AGENTRECALL_ROUTER_HERMES_TOKEN=<router-ingress-token>
 AGENTRECALL_ROUTER_LOCAL_SERVICE_TOKEN=<local-Hermes-service-token>
-AGENTRECALL_ROUTER_CLOUD_SERVICE_TOKEN=<cloud-fallback-token>
+# AGENTRECALL_ROUTER_CLOUD_SERVICE_TOKEN=<cloud-fallback-token>
 ```
 
-Configure Hermes with one Streamable HTTP MCP endpoint: `http://127.0.0.1:8788/mcp`. Give Hermes only the router-ingress token; the router injects separate service credentials and never returns them to Hermes. A confirmed connection-establishment failure to local may be routed to cloud for that request. A timeout, reset or lost response after sending is ambiguous and returns a temporary error; never automatically retry/fail over such a write. The router never queries DuckDB.
+Configure Hermes with one Streamable HTTP MCP endpoint: `http://127.0.0.1:8788/mcp`. Give Hermes only the router-ingress token; the router injects separate service credentials and never returns them to Hermes. Cloud fallback is optional: leave both cloud variables unset for local-only operation, where a local connection failure returns a clear `503`. If fallback is enabled, a confirmed connection-establishment failure to local may be routed to cloud for that request. A timeout, reset or lost response after sending is ambiguous and returns a temporary error; never automatically retry/fail over such a write. The router never queries DuckDB.
 
 ## Cue and active memory behavior
 

@@ -46,7 +46,7 @@ flowchart TB
     Cloud --> CloudDB[("Cloud DuckDB file")]
 
     Hermes["Hermes"] -->|"loopback MCP"| Router["Local-first router<br/>127.0.0.1:8788"]
-    Router -->|"normal route"| Local["Local AgentRecall service<br/>127.0.0.1:8787"]
+    Router -->|"normal route"| Local["Local AgentRecall service<br/>127.0.0.1:8789"]
     Router -.->|"confirmed local connect failure only"| Proxy
     Local --> LocalDB[("Local DuckDB file")]
     Local -->|"local-initiated HTTPS event sync"| Cloud
@@ -81,9 +81,9 @@ cargo run --release -- serve
 
 The service exposes aggregate Prometheus metrics at `/metrics` and detailed readiness, including replication lag and HNSW-active state, at `/health/ready`. Restrict health and metrics routes to trusted monitoring networks; see [metrics and readiness operations](docs/operations.md#metrics-and-readiness).
 
-The service listens on `127.0.0.1:8787` by default and fails closed if its token file is missing or invalid. See [.env.example](.env.example) for the `AGENTRECALL_` settings. Do not commit real credentials or secrets.
+The service listens on `127.0.0.1:8789` by default and fails closed if its token file is missing or invalid. See [.env.example](.env.example) for the `AGENTRECALL_` settings. Do not commit real credentials or secrets.
 
-For Hermes local-first routing, run `cargo run --release -- serve-router` on the Hermes machine and configure Hermes with only the loopback router endpoint and ingress credential. The router keeps separate local-service and cloud-fallback credentials. Follow the complete [deployment guide](docs/deployment.md); registering a server alone does not install memory-use behavior in either client.
+For Hermes local-first routing, run `cargo run --release -- serve-router` on the Hermes machine and configure Hermes with only the loopback router endpoint and ingress credential. The router keeps separate local-service and optional cloud-fallback credentials; leave both cloud variables unset for local-only operation. Follow the complete [deployment guide](docs/deployment.md); registering a server alone does not install memory-use behavior in either client.
 
 ## Search and replication details
 

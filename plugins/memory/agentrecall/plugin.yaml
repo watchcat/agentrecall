@@ -1,0 +1,8 @@
+name: agentrecall
+version: 0.1.0
+description: Shared AgentRecall memory over MCP Streamable HTTP.
+hooks:
+  - prefetch
+  - queue_prefetch
+  - on_session_end
+  - on_memory_write

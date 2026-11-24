@@ -24,10 +24,10 @@ use tower_http::timeout::TimeoutLayer;
 struct RouterConfig {
     bind: String,
     local_url: String,
-    cloud_url: String,
+    cloud_url: Option<String>,
     hermes_token: String,
     local_token: String,
-    cloud_token: String,
+    cloud_token: Option<String>,
     allowed_origins: Vec<String>,
 }
 
@@ -164,15 +164,45 @@ impl RouterConfig {
         let bind = env::var("AGENTRECALL_ROUTER_BIND_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8788".to_owned());
         let local_url = env::var("AGENTRECALL_ROUTER_LOCAL_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8787/mcp".to_owned());
-        let cloud_url = env::var("AGENTRECALL_ROUTER_CLOUD_URL")
-            .context("AGENTRECALL_ROUTER_CLOUD_URL is required")?;
+            .unwrap_or_else(|_| "http://127.0.0.1:8789/mcp".to_owned());
+        let cloud_url = env::var("AGENTRECALL_ROUTER_CLOUD_URL").ok();
         let hermes_token = env::var("AGENTRECALL_ROUTER_HERMES_TOKEN")
             .context("AGENTRECALL_ROUTER_HERMES_TOKEN is required")?;
         let local_token = env::var("AGENTRECALL_ROUTER_LOCAL_SERVICE_TOKEN")
             .context("AGENTRECALL_ROUTER_LOCAL_SERVICE_TOKEN is required")?;
-        let cloud_token = env::var("AGENTRECALL_ROUTER_CLOUD_SERVICE_TOKEN")
-            .context("AGENTRECALL_ROUTER_CLOUD_SERVICE_TOKEN is required")?;
+        let cloud_token = env::var("AGENTRECALL_ROUTER_CLOUD_SERVICE_TOKEN").ok();
+        let allowed_origins = env::var("AGENTRECALL_ROUTER_ALLOWED_ORIGINS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Self::from_values(
+            bind,
+            local_url,
+            cloud_url,
+            hermes_token,
+            local_token,
+            cloud_token,
+            allowed_origins,
+        )
+    }
+
+    fn from_values(
+        bind: String,
+        local_url: String,
+        cloud_url: Option<String>,
+        hermes_token: String,
+        local_token: String,
+        cloud_token: Option<String>,
+        allowed_origins: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        if cloud_url.is_some() != cloud_token.is_some() {
+            anyhow::bail!(
+                "AGENTRECALL_ROUTER_CLOUD_URL and AGENTRECALL_ROUTER_CLOUD_SERVICE_TOKEN must be configured together"
+            );
+        }
         let local = url::Url::parse(&local_url)?;
         if !(local.scheme() == "http"
             && local
@@ -188,29 +218,27 @@ impl RouterConfig {
                 "the local MCP route must be an HTTP loopback /mcp URL without credentials or query data"
             );
         }
-        let cloud = url::Url::parse(&cloud_url)?;
-        if cloud.scheme() != "https"
-            || cloud.host_str().is_none()
-            || cloud.path() != "/mcp"
-            || !cloud.username().is_empty()
-            || cloud.password().is_some()
-            || cloud.query().is_some()
-            || cloud.fragment().is_some()
-        {
-            anyhow::bail!(
-                "the cloud MCP route must be an HTTPS /mcp URL without credentials or query data"
-            );
+        if let Some(cloud_url) = cloud_url.as_deref() {
+            let cloud = url::Url::parse(cloud_url)?;
+            if cloud.scheme() != "https"
+                || cloud.host_str().is_none()
+                || cloud.path() != "/mcp"
+                || !cloud.username().is_empty()
+                || cloud.password().is_some()
+                || cloud.query().is_some()
+                || cloud.fragment().is_some()
+            {
+                anyhow::bail!(
+                    "the cloud MCP route must be an HTTPS /mcp URL without credentials or query data"
+                );
+            }
         }
-        if hermes_token.len() < 32 || local_token.len() < 32 || cloud_token.len() < 32 {
+        if hermes_token.len() < 32
+            || local_token.len() < 32
+            || cloud_token.as_deref().is_some_and(|token| token.len() < 32)
+        {
             anyhow::bail!("router credentials are missing or too short");
         }
-        let allowed_origins = env::var("AGENTRECALL_ROUTER_ALLOWED_ORIGINS")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
         Ok(Self {
             bind,
             local_url,
@@ -380,8 +408,23 @@ async fn forward(State(state): State<RouterState>, request: Request<Body>) -> Re
     }
     let chosen = existing.as_ref().map_or(Route::Local, |a| a.route);
     let (url, token) = match chosen {
-        Route::Local => (&state.config.local_url, &state.config.local_token),
-        Route::Cloud => (&state.config.cloud_url, &state.config.cloud_token),
+        Route::Local => (
+            state.config.local_url.as_str(),
+            state.config.local_token.as_str(),
+        ),
+        Route::Cloud => match (
+            state.config.cloud_url.as_deref(),
+            state.config.cloud_token.as_deref(),
+        ) {
+            (Some(url), Some(token)) => (url, token),
+            _ => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "request is pinned to cloud but cloud routing is not configured",
+                )
+                    .into_response();
+            }
+        },
     };
     let attempt = send_upstream(
         &state,
@@ -393,85 +436,119 @@ async fn forward(State(state): State<RouterState>, request: Request<Body>) -> Re
     )
     .await;
     let mut dispatched_route = chosen;
-    let upstream =
-        match attempt {
-            Ok(response) => response,
-            Err(error)
-                if safe_write_failover(key.is_some(), existing.is_some(), error.is_connect())
-                    && chosen == Route::Local =>
+    let upstream = match attempt {
+        Ok(response) => response,
+        Err(error) if error.is_connect() && state.config.cloud_url.is_none() => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "local AgentRecall service unavailable; cloud failover is not configured",
+            )
+                .into_response();
+        }
+        Err(error)
+            if safe_write_failover(key.is_some(), existing.is_some(), error.is_connect())
+                && chosen == Route::Local =>
+        {
+            let (cloud_url, cloud_token) = match (
+                state.config.cloud_url.as_deref(),
+                state.config.cloud_token.as_deref(),
+            ) {
+                (Some(url), Some(token)) => (url, token),
+                _ => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "local AgentRecall service unavailable; cloud failover is not configured",
+                    )
+                        .into_response();
+                }
+            };
+            let Some(key) = key.as_ref() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "MCP route state unavailable",
+                )
+                    .into_response();
+            };
+            if state
+                .affinity
+                .set(
+                    key.clone(),
+                    Affinity {
+                        route: Route::Cloud,
+                        result_known: false,
+                    },
+                )
+                .is_err()
             {
-                let Some(key) = key.as_ref() else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "MCP route state unavailable",
+                )
+                    .into_response();
+            }
+            dispatched_route = Route::Cloud;
+            match send_upstream(
+                &state,
+                cloud_url,
+                cloud_token,
+                &parts.method,
+                &parts.headers,
+                bytes,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(_) => {
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "MCP route state unavailable",
+                        "MCP service temporarily unavailable",
                     )
                         .into_response();
-                };
-                if state
-                    .affinity
-                    .set(
-                        key.clone(),
-                        Affinity {
-                            route: Route::Cloud,
-                            result_known: false,
-                        },
-                    )
-                    .is_err()
-                {
+                }
+            }
+        }
+        Err(error) if error.is_connect() && key.is_none() => {
+            let (cloud_url, cloud_token) = match (
+                state.config.cloud_url.as_deref(),
+                state.config.cloud_token.as_deref(),
+            ) {
+                (Some(url), Some(token)) => (url, token),
+                _ => {
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "MCP route state unavailable",
+                        "local AgentRecall service unavailable; cloud failover is not configured",
                     )
                         .into_response();
                 }
-                dispatched_route = Route::Cloud;
-                match send_upstream(
-                    &state,
-                    &state.config.cloud_url,
-                    &state.config.cloud_token,
-                    &parts.method,
-                    &parts.headers,
-                    bytes,
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(_) => {
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "MCP service temporarily unavailable",
-                        )
-                            .into_response();
-                    }
+            };
+            match send_upstream(
+                &state,
+                cloud_url,
+                cloud_token,
+                &parts.method,
+                &parts.headers,
+                bytes,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "MCP service temporarily unavailable",
+                    )
+                        .into_response();
                 }
             }
-            Err(error) if error.is_connect() && key.is_none() => {
-                match send_upstream(
-                    &state,
-                    &state.config.cloud_url,
-                    &state.config.cloud_token,
-                    &parts.method,
-                    &parts.headers,
-                    bytes,
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(_) => {
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "MCP service temporarily unavailable",
-                        )
-                            .into_response();
-                    }
-                }
-            }
-            Err(_) => return (
+        }
+        Err(_) => {
+            return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "upstream outcome is unknown; retry the same route with the same idempotency key",
             )
-                .into_response(),
-        };
+                .into_response();
+        }
+    };
     let status = upstream.status();
     let mut response_builder = Response::builder().status(status);
     for name in [
@@ -589,13 +666,30 @@ mod affinity_tests {
             config: RouterConfig {
                 bind: "127.0.0.1:8788".to_owned(),
                 local_url,
-                cloud_url,
+                cloud_url: Some(cloud_url),
                 hermes_token: "h".repeat(32),
                 local_token: "l".repeat(32),
-                cloud_token: "c".repeat(32),
+                cloud_token: Some("c".repeat(32)),
                 allowed_origins: Vec::new(),
             },
             client: build_upstream_client(Duration::from_secs(2), timeout).unwrap(),
+            limiter: crate::auth::RateLimiter::new(120),
+            affinity: AffinityStore::open(affinity_path).unwrap(),
+        }
+    }
+
+    fn local_only_state(local_url: String, affinity_path: PathBuf) -> RouterState {
+        RouterState {
+            config: RouterConfig {
+                bind: "127.0.0.1:8788".to_owned(),
+                local_url,
+                cloud_url: None,
+                hermes_token: "h".repeat(32),
+                local_token: "l".repeat(32),
+                cloud_token: None,
+                allowed_origins: Vec::new(),
+            },
+            client: build_upstream_client(Duration::from_secs(2), Duration::from_secs(2)).unwrap(),
             limiter: crate::auth::RateLimiter::new(120),
             affinity: AffinityStore::open(affinity_path).unwrap(),
         }
@@ -608,6 +702,80 @@ mod affinity_tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    #[test]
+    fn local_only_configuration_needs_no_cloud_route() {
+        let config = RouterConfig::from_values(
+            "127.0.0.1:8788".to_owned(),
+            "http://127.0.0.1:8789/mcp".to_owned(),
+            None,
+            "h".repeat(32),
+            "l".repeat(32),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(config.cloud_url.is_none());
+        assert!(config.cloud_token.is_none());
+        assert_eq!(config.local_url, "http://127.0.0.1:8789/mcp");
+        assert!(
+            RouterConfig::from_values(
+                "127.0.0.1:8788".to_owned(),
+                "http://127.0.0.1:8789/mcp".to_owned(),
+                Some("https://memory.example.net/mcp".to_owned()),
+                "h".repeat(32),
+                "l".repeat(32),
+                None,
+                Vec::new(),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_only_router_returns_clear_error_when_local_service_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = local_only_state(
+            unavailable_upstream().await,
+            dir.path().join("affinity.json"),
+        );
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_search","arguments":{"query":"test"}}}"#;
+        let response = forward(State(state), mcp_request(body)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "local AgentRecall service unavailable; cloud failover is not configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_only_router_returns_clear_error_for_affined_write_when_local_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"memory_update","arguments":{"id":"existing","revision":2,"content":"updated"}}}"#;
+        let state = local_only_state(
+            unavailable_upstream().await,
+            dir.path().join("affinity.json"),
+        );
+        let key = affinity_key(body.as_bytes()).unwrap();
+        state
+            .affinity
+            .set(
+                key,
+                Affinity {
+                    route: Route::Local,
+                    result_known: true,
+                },
+            )
+            .unwrap();
+        let response = forward(State(state), mcp_request(body)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            "local AgentRecall service unavailable; cloud failover is not configured"
+        );
     }
 
     #[tokio::test]

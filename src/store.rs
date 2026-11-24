@@ -142,6 +142,8 @@ struct OperationalMetrics {
     search_latencies_ns: Mutex<VecDeque<(Instant, u64)>>,
     hnsw_search_attempts: AtomicU64,
     hnsw_exact_fallbacks: AtomicU64,
+    owner_quota_rejections: AtomicU64,
+    replication_failures: AtomicU64,
 }
 
 impl OperationalMetrics {
@@ -216,6 +218,8 @@ pub struct OperationalSnapshot {
     pub hnsw_index_estimated_bytes: usize,
     pub hnsw_index_budget_bytes: usize,
     pub hnsw_active: bool,
+    pub owner_quota_rejections_total: u64,
+    pub replication_failures_total: u64,
     pub replication_queue_depth: i64,
     pub replication_lag_events: i64,
     pub replication_lag_seconds: i64,
@@ -478,6 +482,14 @@ impl Store {
             hnsw_index_estimated_bytes,
             hnsw_index_budget_bytes: SEMANTIC_INDEX_MEMORY_BUDGET,
             hnsw_active,
+            owner_quota_rejections_total: self
+                .operational_metrics
+                .owner_quota_rejections
+                .load(Ordering::Relaxed),
+            replication_failures_total: self
+                .operational_metrics
+                .replication_failures
+                .load(Ordering::Relaxed),
             replication_queue_depth,
             replication_lag_events,
             replication_lag_seconds,
@@ -537,6 +549,12 @@ impl Store {
             )
             .map_err(storage_error)?;
         Ok(())
+    }
+
+    pub(crate) fn record_replication_failure(&self) {
+        self.operational_metrics
+            .replication_failures
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Turn expired live records into replicated tombstones and compact safe event-log prefixes.
@@ -1134,6 +1152,9 @@ impl Store {
             )
             .map_err(storage_error)?;
         if count >= self.quota_per_owner {
+            self.operational_metrics
+                .owner_quota_rejections
+                .fetch_add(1, Ordering::Relaxed);
             return Err(AppError::QuotaExceeded);
         }
 
@@ -2768,6 +2789,32 @@ mod tests {
         assert_eq!(metrics.search_latency_sample_count(), 5);
         assert_eq!(metrics.search_latency_p95_seconds(), Some(0.005));
         assert_eq!(metrics.hnsw_fallback_rate(), 0.25);
+    }
+
+    #[test]
+    fn owner_quota_rejections_and_replication_failures_are_counted() {
+        let directory = tempdir().expect("temporary directory");
+        let store = Store::open(
+            &directory.path().join("metrics.duckdb"),
+            "metrics-replica",
+            1,
+        )
+        .expect("open store");
+        let auth = auth("owner-a", "cue");
+        store
+            .save_record(&auth, record("first record"), None, "")
+            .expect("save within quota");
+        assert!(matches!(
+            store.save_record(&auth, record("over quota"), None, ""),
+            Err(AppError::QuotaExceeded)
+        ));
+        store.record_replication_failure();
+
+        let snapshot = store
+            .operational_snapshot(Some("peer-replica"))
+            .expect("operational snapshot");
+        assert_eq!(snapshot.owner_quota_rejections_total, 1);
+        assert_eq!(snapshot.replication_failures_total, 1);
     }
 
     fn auth(owner: &str, client: &str) -> AuthContext {

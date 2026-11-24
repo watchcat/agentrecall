@@ -24,6 +24,21 @@ AGENTRECALL_TRUSTED_REPLICA_ID=local-<stable-id>
 
 Provision a distinct Cue bearer credential in the cloud token file. Do not use the local Hermes credential on the cloud instance. Configure the reverse proxy's TLS certificate verification and do not publish the service on plaintext HTTP.
 
+## TLS termination and certificate verification
+
+Keep `AGENTRECALL_BIND_ADDR=127.0.0.1:8787` on the cloud host. Terminate public TLS on a reverse proxy running on that same host, expose only TCP 443, and block external access to port 8787. [The Caddy example](../examples/deployment/Caddyfile) obtains and renews a publicly trusted certificate for `memory.example.net`, forwards only `/mcp` and `/_internal/replication/exchange`, and limits `/health/*` and `/metrics` to a monitoring source CIDR. Replace the example hostname and `203.0.113.10/32` with the actual hostname and source address as Caddy sees it. Caddy's reverse proxy passes request headers through and supports streaming; retain `Authorization`, `Origin`, `Accept`, `Content-Type`, and `MCP-Protocol-Version` if adapting the example to another proxy. Do not expose operator CLI paths.
+
+Cue and the Hermes router's cloud hop must use `https://memory.example.net/mcp` and validate the certificate chain and hostname. The local replica's `AGENTRECALL_PEER_URL` accepts HTTPS only; its Reqwest/Rustls client retains normal CA and hostname verification, rejects plaintext HTTP, and does not follow redirects. Keep a complete, unexpired certificate chain whose SAN matches the peer hostname. The client bearer token is separate from TLS and does not replace certificate verification. Never use an insecure certificate-verification option or a self-signed leaf certificate. This deployment uses a public CA; the service does not expose a custom CA-bundle setting.
+
+From a network that can reach the public endpoint, verify the presented chain without suppressing errors:
+
+```sh
+openssl s_client -connect memory.example.net:443 \
+  -servername memory.example.net -verify_return_error </dev/null
+```
+
+The replication client's HTTPS-only behavior and peer URL validation are covered by Rust tests (`replication_client_rejects_plaintext_http_urls` and `replication_peer_urls_require_https_without_embedded_credentials_or_query_data`). If TLS terminates on a separate load balancer, restrict its origin link to the private network and enable origin-certificate verification there too; do not expose the service's plaintext listener publicly.
+
 ## Local service and replication
 
 Run a separate local service process with its own DuckDB path and Hermes client credential. Keep it bound to loopback by default. The local service initiates the exchange, so it works behind a home NAT/firewall:

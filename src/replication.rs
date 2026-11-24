@@ -53,6 +53,14 @@ pub fn source_replica_is_trusted(
     trusted_replica_id.is_some_and(|trusted| !trusted.is_empty() && trusted == claimed_replica_id)
 }
 
+fn build_replication_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()
+}
+
 pub fn receive_exchange(
     store: &Store,
     request: SyncRequest,
@@ -82,10 +90,7 @@ pub async fn run_worker(
     peer_token: String,
     peer_replica_id: String,
 ) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-    {
+    let client = match build_replication_client() {
         Ok(client) => client,
         Err(_) => {
             tracing::error!("replication worker could not create HTTP client");
@@ -96,6 +101,7 @@ pub async fn run_worker(
         if let Err(error) =
             sync_once(&client, &store, &peer_url, &peer_token, &peer_replica_id).await
         {
+            store.record_replication_failure();
             tracing::warn!(error = %error, "replication exchange failed; durable changes remain queued");
         }
         sleep(Duration::from_secs(5)).await;
@@ -139,7 +145,9 @@ async fn sync_once(
 mod tests {
     use std::collections::HashSet;
 
-    use super::{SyncRequest, receive_exchange, source_replica_is_trusted};
+    use super::{
+        SyncRequest, build_replication_client, receive_exchange, source_replica_is_trusted,
+    };
     use crate::{
         auth::AuthContext,
         domain::{Memory, MemoryKind, Provenance, now_rfc3339},
@@ -154,6 +162,18 @@ mod tests {
         assert!(!source_replica_is_trusted(Some("local-a"), "other-replica"));
         assert!(!source_replica_is_trusted(None, "local-a"));
         assert!(!source_replica_is_trusted(Some(""), ""));
+    }
+
+    #[tokio::test]
+    async fn replication_client_rejects_plaintext_http_urls() {
+        let client = build_replication_client().expect("build secure replication client");
+        assert!(
+            client
+                .get("http://127.0.0.1/replication")
+                .send()
+                .await
+                .is_err()
+        );
     }
 
     #[test]

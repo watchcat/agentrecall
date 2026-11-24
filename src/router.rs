@@ -223,6 +223,18 @@ impl RouterConfig {
     }
 }
 
+fn build_upstream_client(
+    connect_timeout: Duration,
+    timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(timeout)
+        // The local hop is intentionally loopback HTTP; no redirect may downgrade a cloud hop.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 pub async fn serve() -> anyhow::Result<()> {
     let config = RouterConfig::from_env()?;
     let affinity = AffinityStore::open(affinity_path()?)?;
@@ -230,10 +242,7 @@ pub async fn serve() -> anyhow::Result<()> {
     if !address.ip().is_loopback() {
         anyhow::bail!("Hermes router ingress must be bound to loopback");
     }
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(30))
-        .build()?;
+    let client = build_upstream_client(Duration::from_secs(3), Duration::from_secs(30))?;
     let state = RouterState {
         config,
         client,
@@ -586,11 +595,7 @@ mod affinity_tests {
                 cloud_token: "c".repeat(32),
                 allowed_origins: Vec::new(),
             },
-            client: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(timeout)
-                .build()
-                .unwrap(),
+            client: build_upstream_client(Duration::from_secs(2), timeout).unwrap(),
             limiter: crate::auth::RateLimiter::new(120),
             affinity: AffinityStore::open(affinity_path).unwrap(),
         }
@@ -603,6 +608,28 @@ mod affinity_tests {
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn upstream_client_does_not_follow_redirects() {
+        let app = Router::new().route(
+            "/redirect",
+            axum::routing::get(|| async {
+                axum::response::Redirect::temporary("http://127.0.0.1:1/")
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = build_upstream_client(Duration::from_secs(2), Duration::from_secs(3)).unwrap();
+        let response = client
+            .get(format!("http://{address}/redirect"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
     }
 
     #[test]

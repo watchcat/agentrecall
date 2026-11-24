@@ -61,9 +61,26 @@ Scrape `GET /metrics` in Prometheus text format. Keep this route and the health 
 - HNSW-eligible semantic-search attempts, exact-vector fallbacks, and their ratio. Queries are eligible only when semantic search and VSS are enabled; the ratio is zero before the first eligible query.
 - Estimated HNSW projection bytes, its 128 MiB budget, and the estimate-to-budget ratio. This is an estimate (`vector rows × embedding dimension × 12`), not DuckDB allocator/RSS telemetry.
 - Replication queue depth (unacknowledged local mutation events), sequence lag, and the age of the oldest unacknowledged event; unresolved conflict count; and rate-limit rejection total.
-- Whether HNSW is active, whether an outbound peer is configured, and the timestamp of the last successful exchange (zero in the metric if none has completed).
+- Whether HNSW is active, whether replication is configured (outbound peer or trusted inbound peer), and the timestamp of the last successful exchange (zero in the metric if none has completed).
+- `agentrecall_replication_failures_total`: failed outbound exchanges since process start. Use `increase()` so process restarts and counter resets are handled; an inbound-only cloud node instead relies on the successful-exchange timestamp becoming stale.
+- `agentrecall_owner_quota_rejections_total`: aggregate count of memory-save requests rejected because an owner's configured memory quota was reached. No owner or client labels are added.
+- `agentrecall_semantic_search_configured` and `agentrecall_semantic_search_active`: whether an embedding provider is configured and whether it is ready. `configured=1, active=0` means the service has fallen back to lexical-only search. `agentrecall_hnsw_active=0` alone does not mean lexical-only: exact-vector scoring is still semantic search.
 
 `GET /health/ready` retains replica ID, search mode/engine, and unresolved conflicts, and now also reports `replication_configured`, `replication_queue_depth`, `replication_lag_events`, `replication_lag_seconds`, `last_successful_sync_at` (RFC 3339 string or `null`), and `hnsw_active`. The last-sync timestamp is persisted in the service database and updates only after a successful inbound or outbound exchange. With no outbound peer, the outbound queue/lag values are zero.
+
+## Prometheus alert rules
+
+Load [`config/prometheus/agentrecall-alerts.yml`](../config/prometheus/agentrecall-alerts.yml) into Prometheus and route its alert names through Alertmanager. The defaults intentionally wait out brief transients; tune them to the scrape interval and the replication recovery objective:
+
+- `AgentRecallUnresolvedConflicts`: `agentrecall_unresolved_conflicts > 0` for 5 minutes. Any remaining conflict needs an operator to inspect and explicitly choose a retained branch; it must never be auto-resolved.
+- `AgentRecallReplicationFailures`: at least 6 increases in `agentrecall_replication_failures_total` within 5 minutes, held for 1 minute. The local worker retries every 5 seconds, so this filters an isolated failure and catches a sustained peer/TLS/credential problem quickly.
+- `AgentRecallReplicationStale`: configured replication with no successful sync timestamp, or a timestamp older than 15 minutes, held for 5 minutes. This covers both outbound local workers and the cloud's trusted inbound peer. The worker normally exchanges every 5 seconds; the wider threshold tolerates short outages.
+- `AgentRecallReplicationBacklogStalled`: a non-empty `agentrecall_replication_queue_depth` and `agentrecall_replication_lag_seconds > 300` held for 5 minutes. The queue/lag metrics describe outbound events, so on an inbound-only cloud node use the stale-success alert.
+- `AgentRecallOwnerQuotaExhausted`: any increase in `agentrecall_owner_quota_rejections_total` over 10 minutes, held for 1 minute. A rejected save is direct evidence that an owner is at the configured quota; review usage and capacity before changing `AGENTRECALL_QUOTA_PER_OWNER`.
+- `AgentRecallSemanticSearchLexicalFallback`: `agentrecall_semantic_search_configured == 1` and `agentrecall_semantic_search_active == 0` for 3 minutes. It does not alert when lexical-only search is the intended configuration and does not confuse HNSW-to-exact-vector fallback with lexical-only mode.
+- `AgentRecallHnswBudgetNearLimit`: `agentrecall_hnsw_index_budget_ratio >= 0.9` for 10 minutes. This is a warning based on the existing estimated 128 MiB HNSW projection budget, not an owner quota or process-RSS measurement.
+
+Run `scripts/check-alert-rules.sh` from the repository root to execute both `promtool check rules` and the bundled alert-expression tests (`promtool test rules`). Install Prometheus's `promtool` first, or set `PROMTOOL` to its executable path. The test cases exercise the alert conditions and their `for` durations. These rules cannot alert if the scrape itself is down; also alert on `up == 0` in the monitoring configuration.
 
 ## Acceptance evidence
 

@@ -1,0 +1,127 @@
+rule_files:
+  - agentrecall-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: unresolved conflict stays actionable
+    interval: 1m
+    input_series:
+      - series: 'agentrecall_unresolved_conflicts{instance="node-a"}'
+        values: '1+0x6'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AgentRecallUnresolvedConflicts
+        exp_alerts:
+          - exp_labels:
+              instance: node-a
+              severity: warning
+            exp_annotations:
+              summary: AgentRecall has unresolved replication conflicts
+              description: "1 conflict(s) remain on node-a. Inspect retained branches and resolve explicitly; never auto-select a branch."
+              runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#conflict-review-and-resolution
+
+  - name: replication failure burst and stale success are detected
+    interval: 1m
+    input_series:
+      - series: 'agentrecall_replication_configured{instance="node-a"}'
+        values: '1+0x6'
+      - series: 'agentrecall_replication_failures_total{instance="node-a"}'
+        values: '0 2 4 6 8 10 12'
+      - series: 'agentrecall_last_successful_sync_timestamp_seconds{instance="node-a"}'
+        values: '0+0x6'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AgentRecallReplicationFailures
+        exp_alerts:
+          - exp_labels:
+              instance: node-a
+              severity: warning
+            exp_annotations:
+              summary: AgentRecall replication exchanges are failing
+              description: "At least six outbound exchanges failed in five minutes on node-a. Check DNS, TLS certificate/hostname validity, peer availability, credentials, and logs."
+              runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#replica-health-and-recovery
+      - eval_time: 6m
+        alertname: AgentRecallReplicationStale
+        exp_alerts:
+          - exp_labels:
+              instance: node-a
+              severity: critical
+            exp_annotations:
+              summary: AgentRecall has not completed a replication exchange recently
+              description: "No successful exchange has been recorded for at least 15 minutes on node-a (or none has ever succeeded). Check the peer, TLS trust/hostname, credentials, and replication logs."
+              runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#replica-health-and-recovery
+
+  - name: persistent replication backlog is detected
+    interval: 1m
+    input_series:
+      - series: 'agentrecall_replication_configured{instance="node-a"}'
+        values: '1+0x6'
+      - series: 'agentrecall_replication_queue_depth{instance="node-a"}'
+        values: '1+0x6'
+      - series: 'agentrecall_replication_lag_seconds{instance="node-a"}'
+        values: '600+0x6'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AgentRecallReplicationBacklogStalled
+        exp_alerts:
+          - exp_labels:
+              instance: node-a
+              severity: warning
+            exp_annotations:
+              summary: AgentRecall has a persistent replication backlog
+              description: "600 seconds of oldest-event lag is reported on node-a. Inspect queue depth, peer health, and retention/re-seed status."
+              runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#replica-health-and-recovery
+
+  - name: owner quota rejection is detected
+    interval: 1m
+    input_series:
+      - series: 'agentrecall_owner_quota_rejections_total{instance="node-a"}'
+        values: '0 0 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AgentRecallOwnerQuotaExhausted
+        exp_alerts:
+          - exp_labels:
+              instance: node-a
+              severity: warning
+            exp_annotations:
+              summary: AgentRecall rejected a save at the owner memory quota
+              description: "At least one memory save was rejected in the last ten minutes on node-a. Check the configured per-owner quota and capacity before changing AGENTRECALL_QUOTA_PER_OWNER."
+              runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#metrics-and-readiness
+
+  - name: configured but inactive semantic search is detected
+    interval: 1m
+    input_series:
+      - series: 'agentrecall_semantic_search_configured{instance="node-a"}'
+        values: '1+0x6'
+      - series: 'agentrecall_semantic_search_active{instance="node-a"}'
+        values: '0+0x6'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: AgentRecallSemanticSearchLexicalFallback
+        exp_alerts:
+          - exp_labels:
+              instance: node-a
+              severity: warning
+            exp_annotations:
+              summary: Configured semantic search is inactive; queries are lexical-only
+              description: "An embedding provider is configured but not ready on node-a. Check provider initialization, model assets, and service logs. This alert is distinct from HNSW falling back to exact-vector semantic scoring."
+              runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#provisioning-semantic-search
+
+  - name: estimated HNSW budget pressure is detected
+    interval: 1m
+    input_series:
+      - series: 'agentrecall_hnsw_index_budget_ratio{instance="node-a"}'
+        values: '0.95+0x12'
+    alert_rule_test:
+      - eval_time: 12m
+        alertname: AgentRecallHnswBudgetNearLimit
+        exp_alerts:
+          - exp_labels:
+              instance: node-a
+              severity: warning
+            exp_annotations:
+              summary: AgentRecall estimated HNSW projection memory is near its budget
+              description: "Estimated HNSW projection memory is 95% of the 128 MiB budget on node-a. This is an estimate, not process RSS; review vector growth and the memory plan."
+              runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#metrics-and-readiness

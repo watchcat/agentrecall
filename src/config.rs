@@ -118,11 +118,7 @@ impl Config {
             );
         }
         if let Some(url) = &peer_url {
-            let parsed =
-                url::Url::parse(url).context("AGENTRECALL_PEER_URL must be a valid HTTPS URL")?;
-            if parsed.scheme() != "https" {
-                bail!("AGENTRECALL_PEER_URL must use HTTPS");
-            }
+            validate_peer_url(url)?;
         }
 
         let embedding_provider = env::var("AGENTRECALL_EMBEDDING_PROVIDER").ok();
@@ -156,6 +152,22 @@ impl Config {
             embedding_cache_dir,
         })
     }
+}
+
+fn validate_peer_url(value: &str) -> anyhow::Result<()> {
+    let parsed =
+        url::Url::parse(value).context("AGENTRECALL_PEER_URL must be a valid HTTPS URL")?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        bail!("AGENTRECALL_PEER_URL must use HTTPS and include a host");
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        bail!("AGENTRECALL_PEER_URL must not contain credentials, a query, or a fragment");
+    }
+    Ok(())
 }
 
 fn parse_cursor_signing_keys(
@@ -277,5 +289,23 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn replication_peer_urls_require_https_without_embedded_credentials_or_query_data() {
+        assert!(
+            validate_peer_url("https://memory.example.net/_internal/replication/exchange").is_ok()
+        );
+        for url in [
+            "http://memory.example.net/_internal/replication/exchange",
+            "https://user:password@memory.example.net/_internal/replication/exchange",
+            "https://memory.example.net/_internal/replication/exchange?token=secret",
+            "https://memory.example.net/_internal/replication/exchange#fragment",
+        ] {
+            assert!(
+                validate_peer_url(url).is_err(),
+                "accepted unsafe URL: {url}"
+            );
+        }
     }
 }

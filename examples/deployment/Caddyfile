@@ -1,0 +1,29 @@
+# Run on the cloud host alongside AgentRecall. Caddy provisions and renews a
+# publicly trusted certificate for the site name; the service remains loopback-only.
+memory.example.net {
+	@mcp path /mcp
+	handle @mcp {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	@replication path /_internal/replication/exchange
+	handle @replication {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	# Replace with the source address/CIDR as Caddy sees it. If there is another
+	# load balancer in front, enforce this at that boundary too; do not trust an
+	# arbitrary X-Forwarded-For header for access control.
+	@operations path /health/live /health/ready /metrics
+	handle @operations {
+		@monitor remote_ip 203.0.113.10/32
+		handle @monitor {
+			reverse_proxy 127.0.0.1:8787
+		}
+		respond "forbidden" 403
+	}
+
+	handle {
+		respond "not found" 404
+	}
+}

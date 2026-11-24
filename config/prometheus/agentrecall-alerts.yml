@@ -1,0 +1,84 @@
+groups:
+  - name: agentrecall.operations
+    rules:
+      - alert: AgentRecallUnresolvedConflicts
+        expr: agentrecall_unresolved_conflicts > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: AgentRecall has unresolved replication conflicts
+          description: "{{ $value }} conflict(s) remain on {{ $labels.instance }}. Inspect retained branches and resolve explicitly; never auto-select a branch."
+          runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#conflict-review-and-resolution
+
+      - alert: AgentRecallReplicationFailures
+        expr: |
+          agentrecall_replication_configured == 1
+          and increase(agentrecall_replication_failures_total[5m]) >= 6
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: AgentRecall replication exchanges are failing
+          description: "At least six outbound exchanges failed in five minutes on {{ $labels.instance }}. Check DNS, TLS certificate/hostname validity, peer availability, credentials, and logs."
+          runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#replica-health-and-recovery
+
+      - alert: AgentRecallReplicationStale
+        expr: |
+          agentrecall_replication_configured == 1
+          and (
+            agentrecall_last_successful_sync_timestamp_seconds == 0
+            or time() - agentrecall_last_successful_sync_timestamp_seconds > 900
+          )
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: AgentRecall has not completed a replication exchange recently
+          description: "No successful exchange has been recorded for at least 15 minutes on {{ $labels.instance }} (or none has ever succeeded). Check the peer, TLS trust/hostname, credentials, and replication logs."
+          runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#replica-health-and-recovery
+
+      - alert: AgentRecallReplicationBacklogStalled
+        expr: |
+          agentrecall_replication_lag_seconds > 300
+          and agentrecall_replication_queue_depth > 0
+          and agentrecall_replication_configured == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: AgentRecall has a persistent replication backlog
+          description: "{{ $value }} seconds of oldest-event lag is reported on {{ $labels.instance }}. Inspect queue depth, peer health, and retention/re-seed status."
+          runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#replica-health-and-recovery
+
+      - alert: AgentRecallOwnerQuotaExhausted
+        expr: increase(agentrecall_owner_quota_rejections_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: AgentRecall rejected a save at the owner memory quota
+          description: "At least one memory save was rejected in the last ten minutes on {{ $labels.instance }}. Check the configured per-owner quota and capacity before changing AGENTRECALL_QUOTA_PER_OWNER."
+          runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#metrics-and-readiness
+
+      - alert: AgentRecallSemanticSearchLexicalFallback
+        expr: |
+          agentrecall_semantic_search_configured == 1
+          and agentrecall_semantic_search_active == 0
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: Configured semantic search is inactive; queries are lexical-only
+          description: "An embedding provider is configured but not ready on {{ $labels.instance }}. Check provider initialization, model assets, and service logs. This alert is distinct from HNSW falling back to exact-vector semantic scoring."
+          runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#provisioning-semantic-search
+
+      - alert: AgentRecallHnswBudgetNearLimit
+        expr: agentrecall_hnsw_index_budget_ratio >= 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: AgentRecall estimated HNSW projection memory is near its budget
+          description: "Estimated HNSW projection memory is {{ $value | humanizePercentage }} of the 128 MiB budget on {{ $labels.instance }}. This is an estimate, not process RSS; review vector growth and the memory plan."
+          runbook_url: https://github.com/watchcat/agentrecall/blob/main/docs/operations.md#metrics-and-readiness

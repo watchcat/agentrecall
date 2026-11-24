@@ -225,8 +225,10 @@ async fn metrics(State(state): State<AppState>) -> Response {
         .and_then(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
         .map(|timestamp| timestamp.timestamp())
         .unwrap_or(0);
+    let semantic_search_configured = u8::from(state.config.embedding_provider.is_some());
+    let semantic_search_active = u8::from(store.semantic_ready());
     let body = format!(
-        "# HELP agentrecall_search_p95_latency_seconds Rolling five-minute p95 search latency.\n# TYPE agentrecall_search_p95_latency_seconds gauge\nagentrecall_search_p95_latency_seconds {:.9}\n# HELP agentrecall_search_latency_samples Number of searches in the rolling latency window.\n# TYPE agentrecall_search_latency_samples gauge\nagentrecall_search_latency_samples {}\n# HELP agentrecall_hnsw_search_attempts_total Semantic queries eligible for HNSW retrieval.\n# TYPE agentrecall_hnsw_search_attempts_total counter\nagentrecall_hnsw_search_attempts_total {}\n# HELP agentrecall_hnsw_exact_fallbacks_total HNSW-eligible queries that used exact vector scoring instead.\n# TYPE agentrecall_hnsw_exact_fallbacks_total counter\nagentrecall_hnsw_exact_fallbacks_total {}\n# HELP agentrecall_hnsw_exact_fallback_rate Fraction of HNSW-eligible queries that fell back to exact scoring.\n# TYPE agentrecall_hnsw_exact_fallback_rate gauge\nagentrecall_hnsw_exact_fallback_rate {:.9}\n# HELP agentrecall_hnsw_index_estimated_bytes Estimated HNSW projection memory from vector rows and dimension.\n# TYPE agentrecall_hnsw_index_estimated_bytes gauge\nagentrecall_hnsw_index_estimated_bytes {}\n# HELP agentrecall_hnsw_index_budget_bytes Configured HNSW projection memory budget.\n# TYPE agentrecall_hnsw_index_budget_bytes gauge\nagentrecall_hnsw_index_budget_bytes {}\n# HELP agentrecall_hnsw_index_budget_ratio Estimated HNSW memory divided by its budget.\n# TYPE agentrecall_hnsw_index_budget_ratio gauge\nagentrecall_hnsw_index_budget_ratio {:.9}\n# HELP agentrecall_hnsw_active Whether semantic retrieval is currently using HNSW.\n# TYPE agentrecall_hnsw_active gauge\nagentrecall_hnsw_active {}\n# HELP agentrecall_replication_configured Whether a replication peer is configured.\n# TYPE agentrecall_replication_configured gauge\nagentrecall_replication_configured {}\n# HELP agentrecall_replication_queue_depth Number of local events awaiting peer acknowledgement.\n# TYPE agentrecall_replication_queue_depth gauge\nagentrecall_replication_queue_depth {}\n# HELP agentrecall_replication_lag_events Local sequence distance behind peer acknowledgement.\n# TYPE agentrecall_replication_lag_events gauge\nagentrecall_replication_lag_events {}\n# HELP agentrecall_replication_lag_seconds Age of the oldest unacknowledged local event.\n# TYPE agentrecall_replication_lag_seconds gauge\nagentrecall_replication_lag_seconds {}\n# HELP agentrecall_last_successful_sync_timestamp_seconds Unix timestamp of the last successful replication exchange, or zero if none.\n# TYPE agentrecall_last_successful_sync_timestamp_seconds gauge\nagentrecall_last_successful_sync_timestamp_seconds {}\n# HELP agentrecall_unresolved_conflicts Current unresolved replication conflict count.\n# TYPE agentrecall_unresolved_conflicts gauge\nagentrecall_unresolved_conflicts {}\n# HELP agentrecall_rate_limit_rejections_total Authenticated MCP requests rejected by the rate limiter.\n# TYPE agentrecall_rate_limit_rejections_total counter\nagentrecall_rate_limit_rejections_total {}\n",
+        "# HELP agentrecall_search_p95_latency_seconds Rolling five-minute p95 search latency.\n# TYPE agentrecall_search_p95_latency_seconds gauge\nagentrecall_search_p95_latency_seconds {:.9}\n# HELP agentrecall_search_latency_samples Number of searches in the rolling latency window.\n# TYPE agentrecall_search_latency_samples gauge\nagentrecall_search_latency_samples {}\n# HELP agentrecall_hnsw_search_attempts_total Semantic queries eligible for HNSW retrieval.\n# TYPE agentrecall_hnsw_search_attempts_total counter\nagentrecall_hnsw_search_attempts_total {}\n# HELP agentrecall_hnsw_exact_fallbacks_total HNSW-eligible queries that used exact vector scoring instead.\n# TYPE agentrecall_hnsw_exact_fallbacks_total counter\nagentrecall_hnsw_exact_fallbacks_total {}\n# HELP agentrecall_hnsw_exact_fallback_rate Fraction of HNSW-eligible queries that fell back to exact scoring.\n# TYPE agentrecall_hnsw_exact_fallback_rate gauge\nagentrecall_hnsw_exact_fallback_rate {:.9}\n# HELP agentrecall_hnsw_index_estimated_bytes Estimated HNSW projection memory from vector rows and dimension.\n# TYPE agentrecall_hnsw_index_estimated_bytes gauge\nagentrecall_hnsw_index_estimated_bytes {}\n# HELP agentrecall_hnsw_index_budget_bytes Configured HNSW projection memory budget.\n# TYPE agentrecall_hnsw_index_budget_bytes gauge\nagentrecall_hnsw_index_budget_bytes {}\n# HELP agentrecall_hnsw_index_budget_ratio Estimated HNSW memory divided by its budget.\n# TYPE agentrecall_hnsw_index_budget_ratio gauge\nagentrecall_hnsw_index_budget_ratio {:.9}\n# HELP agentrecall_hnsw_active Whether semantic retrieval is currently using HNSW.\n# TYPE agentrecall_hnsw_active gauge\nagentrecall_hnsw_active {}\n# HELP agentrecall_semantic_search_configured Whether an embedding provider is configured for semantic search.\n# TYPE agentrecall_semantic_search_configured gauge\nagentrecall_semantic_search_configured {}\n# HELP agentrecall_semantic_search_active Whether the configured embedding provider is ready for semantic search.\n# TYPE agentrecall_semantic_search_active gauge\nagentrecall_semantic_search_active {}\n# HELP agentrecall_replication_configured Whether a replication peer is configured.\n# TYPE agentrecall_replication_configured gauge\nagentrecall_replication_configured {}\n# HELP agentrecall_replication_queue_depth Number of local events awaiting peer acknowledgement.\n# TYPE agentrecall_replication_queue_depth gauge\nagentrecall_replication_queue_depth {}\n# HELP agentrecall_replication_lag_events Local sequence distance behind peer acknowledgement.\n# TYPE agentrecall_replication_lag_events gauge\nagentrecall_replication_lag_events {}\n# HELP agentrecall_replication_lag_seconds Age of the oldest unacknowledged local event.\n# TYPE agentrecall_replication_lag_seconds gauge\nagentrecall_replication_lag_seconds {}\n# HELP agentrecall_last_successful_sync_timestamp_seconds Unix timestamp of the last successful replication exchange, or zero if none.\n# TYPE agentrecall_last_successful_sync_timestamp_seconds gauge\nagentrecall_last_successful_sync_timestamp_seconds {}\n# HELP agentrecall_replication_failures_total Failed outbound replication exchanges since process start.\n# TYPE agentrecall_replication_failures_total counter\nagentrecall_replication_failures_total {}\n# HELP agentrecall_unresolved_conflicts Current unresolved replication conflict count.\n# TYPE agentrecall_unresolved_conflicts gauge\nagentrecall_unresolved_conflicts {}\n# HELP agentrecall_owner_quota_rejections_total Memory-save requests rejected because the owner quota was reached.\n# TYPE agentrecall_owner_quota_rejections_total counter\nagentrecall_owner_quota_rejections_total {}\n# HELP agentrecall_rate_limit_rejections_total Authenticated MCP requests rejected by the rate limiter.\n# TYPE agentrecall_rate_limit_rejections_total counter\nagentrecall_rate_limit_rejections_total {}\n",
         snapshot.search_p95_latency_seconds,
         snapshot.search_latency_samples,
         snapshot.hnsw_search_attempts,
@@ -236,12 +238,18 @@ async fn metrics(State(state): State<AppState>) -> Response {
         snapshot.hnsw_index_budget_bytes,
         budget_ratio,
         u8::from(snapshot.hnsw_active),
-        u8::from(state.config.peer_replica_id.is_some()),
+        semantic_search_configured,
+        semantic_search_active,
+        u8::from(
+            state.config.peer_replica_id.is_some() || state.config.trusted_replica_id.is_some()
+        ),
         snapshot.replication_queue_depth,
         snapshot.replication_lag_events,
         snapshot.replication_lag_seconds,
         last_successful_sync_timestamp,
+        snapshot.replication_failures_total,
         snapshot.unresolved_conflicts,
+        snapshot.owner_quota_rejections_total,
         state.rate_limiter.rejections_total(),
     );
     let mut response = (StatusCode::OK, body).into_response();
@@ -361,8 +369,8 @@ mod tests {
             peer_url: None,
             peer_token: None,
             peer_replica_id: None,
-            trusted_replica_id: None,
-            embedding_provider: None,
+            trusted_replica_id: Some("peer-replica".into()),
+            embedding_provider: Some("bge-m3".into()),
             embedding_cache_dir: directory.path().join("models"),
         };
         let cancellation = CancellationToken::new();
@@ -469,11 +477,19 @@ mod tests {
             "agentrecall_hnsw_index_estimated_bytes",
             "agentrecall_hnsw_index_budget_bytes",
             "agentrecall_replication_queue_depth",
+            "agentrecall_replication_failures_total",
+            "agentrecall_replication_configured",
             "agentrecall_unresolved_conflicts",
+            "agentrecall_owner_quota_rejections_total",
+            "agentrecall_semantic_search_configured",
+            "agentrecall_semantic_search_active",
             "agentrecall_rate_limit_rejections_total",
         ] {
             assert!(metrics_body.contains(metric), "missing metric {metric}");
         }
+        assert!(metrics_body.contains("agentrecall_replication_configured 1"));
+        assert!(metrics_body.contains("agentrecall_semantic_search_configured 1"));
+        assert!(metrics_body.contains("agentrecall_semantic_search_active 0"));
         assert!(metrics_body.contains("agentrecall_search_latency_samples 1"));
         server.abort();
     }

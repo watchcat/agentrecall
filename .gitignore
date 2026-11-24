@@ -1,0 +1,10 @@
+/target
+/data/
+/.fastembed_cache/
+*.duckdb
+*.duckdb.wal
+.env
+.env.*
+!.env.example
+config/tokens.json
+config/*.secret

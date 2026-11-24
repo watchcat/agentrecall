@@ -1,0 +1,10 @@
+[
+  {
+    "token_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "owner_id": "replace-with-private-owner-id",
+    "client_id": "cue",
+    "scopes": ["memory:read", "memory:write"],
+    "allowed_namespaces": ["shared"],
+    "active": true
+  }
+]

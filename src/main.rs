@@ -1,6 +1,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod auth;
+mod backup;
 mod config;
 mod domain;
 mod embedding;
@@ -16,6 +17,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -84,6 +86,30 @@ enum Command {
     InstallFts,
     /// Explicitly provision the DuckDB VSS extension; service startup never downloads extensions.
     InstallVss,
+    /// Create a private checkpointed backup without replacing an existing file.
+    Backup {
+        #[arg(
+            long,
+            env = "AGENTRECALL_DATABASE_PATH",
+            default_value = "./data/agentrecall.duckdb"
+        )]
+        database: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Restore to a new path after validating DuckDB integrity, cursors, and mutation history.
+    Restore {
+        #[arg(long)]
+        backup: PathBuf,
+        #[arg(
+            long,
+            env = "AGENTRECALL_DATABASE_PATH",
+            default_value = "./data/agentrecall.duckdb"
+        )]
+        database: PathBuf,
+        #[arg(long, required = true)]
+        verify: bool,
+    },
     /// Show retained replication conflicts. Stop the service before opening its database file.
     ListConflicts {
         #[arg(
@@ -154,6 +180,34 @@ async fn main() -> anyhow::Result<()> {
         Command::ServeRouter => router::serve().await,
         Command::InstallFts => install_fts(),
         Command::InstallVss => install_vss(),
+        Command::Backup { database, output } => {
+            let report = backup::backup_database(&database, &output)?;
+            println!(
+                "Verified backup {} (replica {}, local sequence {}, {} mutation events, {} peers).",
+                output.display(),
+                report.replica_id,
+                report.local_sequence,
+                report.mutation_events,
+                report.peers
+            );
+            Ok(())
+        }
+        Command::Restore {
+            backup: source,
+            database,
+            verify,
+        } => {
+            let report = backup::restore_database(&source, &database, verify)?;
+            println!(
+                "Restored and verified {} (replica {}, local sequence {}, {} mutation events, {} peers).",
+                database.display(),
+                report.replica_id,
+                report.local_sequence,
+                report.mutation_events,
+                report.peers
+            );
+            Ok(())
+        }
         Command::ListConflicts { database } => list_conflicts(database),
         Command::ResolveConflict {
             database,
@@ -387,6 +441,22 @@ async fn serve() -> anyhow::Result<()> {
                 config.db_path.display()
             )
         })?;
+    let collector_store = store.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+        loop {
+            interval.tick().await;
+            match collector_store.collect_expired_and_compact() {
+                Ok(summary) => tracing::info!(
+                    expired_records = summary.expired_records,
+                    purged_mutation_events = summary.purged_mutation_events,
+                    purged_applied_events = summary.purged_applied_events,
+                    "retention collection completed"
+                ),
+                Err(error) => tracing::warn!(error = %error, "retention collection failed"),
+            }
+        }
+    });
     let memory = if config.embedding_provider.as_deref() == Some("bge-m3") {
         tracing::info!(
             "initializing local BGE-M3 embeddings (first run may download model assets)"

@@ -69,11 +69,13 @@ Scrape `GET /metrics` in Prometheus text format. Keep this route and the health 
 
 Before rollout, capture the following evidence from the target host and a disposable test token/database:
 
-1. Run `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets`, and `cargo clippy --all-targets --all-features -- -D warnings` successfully; verify `agentrecall --help` lists both token commands.
+1. Run `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets`, and `cargo clippy --all-targets --all-features -- -D warnings` successfully; verify `agentrecall --help` lists token, `backup`, and `restore --verify` commands.
 2. Create a disposable client token, confirm its raw value is absent from the JSON file and the file mode is `0600` on Unix; rotate it and verify the new token authenticates while the old token gets 401 after restart. Revoke the client and verify its token gets 401 after restart.
 3. After a search, confirm `/metrics` reports a nonzero search sample count and p95 field. Check the HNSW active/estimate/budget metrics against the configured extension state; force an exact fallback in a controlled test and confirm the fallback counter/rate increases.
 4. Queue a local mutation against a test peer, verify queue depth and lag are positive, complete an exchange, and confirm they return to zero and `last_successful_sync_at` advances. Create and resolve a test conflict to validate the unresolved-conflict gauge; exceed a test limiter threshold to validate the rejection counter.
 5. Rotate cursor keys with an old secret and a future deadline; confirm old- and new-key cursors both validate before the deadline, the old key fails at/after the deadline and after its configuration is removed, and new-key cursors continue to validate.
+6. In a disposable database, create an expiring record with a derived embedding, run the collector, and confirm the record becomes a replicated tombstone, its embedding/FTS projections disappear, and an unresolved conflict is not silently collected. Age test events past 90 days while a peer cursor remains below the resulting watermark; confirm compaction deletes the aged history rows (including the current version's log row), preserves canonical current state and its current-version envelope, advances the watermark, and rejects stale inbound/outbound cursors. Create and restore a verified current-state backup, confirm the cursor/watermark remain intact, and record that an operator must perform the deployment's coordinated re-seed before the peer reconnects; retry alone must not silently continue.
+7. Stop the service; create a backup and restore it to a new path with `--verify`. Confirm the replica ID, inbound/outbound cursors, local sequence and mutation-log integrity match; tamper with a disposable copy and verify corruption is rejected. Confirm restore refuses to run without `--verify` or overwrite an existing file.
 
 ## Conflict review and resolution
 
@@ -93,6 +95,29 @@ The listing includes the last uncontested record and every retained branch, incl
 
 ## Replica health and recovery
 
-Check `/health/live` for process liveness and `/health/ready` for the stable replica ID, current search mode/engine and unresolved conflict count. The local instance initiates replication to the HTTPS peer, so a temporary disconnection is expected; do not copy either DuckDB file to the other machine. Keep independent, encrypted, access-controlled backups and test each restore on a stopped service using the matching DuckDB build. Preserve service metadata, mutation log, inbox/outbox cursors, tombstones, idempotency ledger and conflict branches. After restore, start the owner process and allow replication to resume from persisted cursors.
+Check `/health/live` for process liveness and `/health/ready` for the stable replica ID, current search mode/engine and unresolved conflict count. The local instance initiates replication to the HTTPS peer, so a temporary disconnection is expected; do not copy either DuckDB file to the other machine. After restoring a replica, start only one instance with that replica identity and allow replication to resume from its persisted cursors.
 
-A deleted record is removed from the canonical live projection and FTS scope immediately, but historical mutation events and backups may retain prior content for recovery and replication. Document retention and backup expiry for the deployment; this release does not purge event history.
+## Deletion and retention
+
+Deleting a record immediately removes its canonical content and derived search rows from that replica and emits a replicated tombstone. Expiry works the same way: the service starts a collector on startup and runs it hourly; it converts expired live records to tombstones, deletes persisted embeddings, and refreshes affected FTS/vector projections. Records involved in unresolved replication conflicts are not automatically expired, because choosing a branch requires explicit conflict resolution.
+
+Deletion is not an immediate erasure of every historical copy. The mutation log and backups can retain earlier save/update payloads, including content, for replication and recovery. The fixed, compile-time defaults are a maximum 90-day age for mutation-log history and a 100,000-event-per-origin cap; neither is runtime-configurable, and whichever threshold is reached first can prune history. The hourly collector prunes the contiguous event prefix through the highest expired/over-cap sequence, even if that also removes newer events before it. It does not wait for peer acknowledgements. The latest event envelope remains alongside each canonical current memory so current state and conflict handling stay intact after that event's history row is pruned. Unresolved conflict branches retain their full branch payloads until an operator resolves them. Conflict-audit rows retain action, actor ID and branch event IDs, not record content. An idempotency entry can retain the original save result indefinitely; this collector does not expire idempotency entries. Backups are independent copies and follow their own encryption and expiry schedule.
+
+Compaction records a per-origin watermark. A peer whose inbound cursor or outbound acknowledgement is below that watermark is rejected rather than receiving a silently incomplete history; the peer needs an operator-led re-seed/resynchronization from a verified current-state backup. A lagging or offline peer does not extend event-history retention. With the collector running hourly, age-based deletion occurs on the first collection after the 90-day cutoff; after a service outage, collection resumes at startup. This is not automatic convergence: restart/retry does not recover missing events, and operators must stop the stale peer and perform a coordinated re-seed from a verified current-state snapshot before reconnecting it. The backup/restore CLI can create and verify the staging snapshot, but restore preserves the source replica ID and cursors; do not run the restored file as a second copy of that replica. Use the deployment's controlled re-seed procedure to initialize the stale peer's state and cursor baseline, then verify one active process per replica ID and a successful exchange. Do not lower cursors or delete watermarks by editing SQL. Monitor replication lag and plan to re-seed peers that miss the window.
+
+## Backup and restore
+
+Stop the service before backing up or restoring: DuckDB is a single-writer file, and the CLI applies migrations/checkpoints during backup. The backup command validates the database, checkpoints it, writes a new private file, and refuses to overwrite an existing destination. Restore requires `--verify`, scans every persisted table to exercise DuckDB's built-in block checksums, and validates migration checksums, cursor bounds, and mutation-event column/JSON consistency. It migrates the staged copy forward if needed and installs only to a new path; it never overwrites an existing database.
+
+```sh
+agentrecall backup \
+  --database /var/lib/agentrecall/instance.duckdb \
+  --output /var/backups/instance-2026-11-24.duckdb
+
+agentrecall restore \
+  --backup /var/backups/instance-2026-11-24.duckdb \
+  --database /var/lib/agentrecall/restored.duckdb \
+  --verify
+```
+
+The restored file preserves its replica ID, local sequence, inbound cursors, outbound acknowledgements, retained mutation history, current-version event envelopes and event-log watermarks. Pruned event history is not reconstructed by restore; use the restored canonical current state when re-seeding a stale peer. Do not run both the original and restored file as the same replica. Keep backups encrypted and access-controlled, and separately protect token files and deployment secrets; they are not part of the DuckDB backup. Validate restores periodically on the matching DuckDB build and retain an independent copy before upgrading or migrating production data.

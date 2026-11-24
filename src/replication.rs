@@ -64,6 +64,9 @@ pub fn receive_exchange(
     {
         return Err(crate::domain::AppError::TemporarilyUnavailable);
     }
+    // The request cursor is the caller's inbound cursor for this replica, so it
+    // is a durable acknowledgement of our outbound events to that peer.
+    store.acknowledge_outbound(&request.source_replica_id, request.remote_cursor)?;
     let accepted_through =
         store.apply_remote_events(&request.source_replica_id, &request.events)?;
     let events = store.events_after(request.remote_cursor, BATCH_SIZE)?;
@@ -134,7 +137,16 @@ async fn sync_once(
 
 #[cfg(test)]
 mod tests {
-    use super::source_replica_is_trusted;
+    use std::collections::HashSet;
+
+    use super::{SyncRequest, receive_exchange, source_replica_is_trusted};
+    use crate::{
+        auth::AuthContext,
+        domain::{Memory, MemoryKind, Provenance, now_rfc3339},
+        store::Store,
+    };
+    use tempfile::tempdir;
+    use uuid::Uuid;
 
     #[test]
     fn replication_source_must_match_configured_trusted_id() {
@@ -142,5 +154,79 @@ mod tests {
         assert!(!source_replica_is_trusted(Some("local-a"), "other-replica"));
         assert!(!source_replica_is_trusted(None, "local-a"));
         assert!(!source_replica_is_trusted(Some(""), ""));
+    }
+
+    #[test]
+    fn exchange_persists_remote_cursor_as_outbound_acknowledgement() {
+        let directory = tempdir().expect("temporary directory");
+        let store = Store::open(
+            &directory.path().join("replication.duckdb"),
+            "local-replica",
+            100,
+        )
+        .expect("open store");
+        let auth = AuthContext {
+            owner_id: "owner".into(),
+            client_id: "cue".into(),
+            scopes: HashSet::from(["memory:read".into(), "memory:write".into()]),
+            allowed_namespaces: HashSet::from(["shared".into()]),
+            token_fingerprint: "test".into(),
+        };
+        let memory = Memory {
+            id: Uuid::now_v7().to_string(),
+            namespace: "shared".into(),
+            content: "replication cursor test".into(),
+            title: None,
+            kind: MemoryKind::Fact,
+            tags: Vec::new(),
+            confidence: 1.0,
+            importance: 0.5,
+            provenance: Provenance::UserStated,
+            source_client: "cue".into(),
+            created_at: now_rfc3339(),
+            updated_at: now_rfc3339(),
+            expires_at: None,
+            revision: 1,
+            deleted_at: None,
+            version_event_id: None,
+        };
+        store
+            .save_record(&auth, memory, None, "")
+            .expect("save local event");
+        assert_eq!(
+            store
+                .pending_events("peer-replica", 10)
+                .expect("unacked events")
+                .len(),
+            1
+        );
+
+        receive_exchange(
+            &store,
+            SyncRequest {
+                source_replica_id: "peer-replica".into(),
+                remote_cursor: 1,
+                events: Vec::new(),
+            },
+        )
+        .expect("receive peer acknowledgement");
+        assert!(
+            store
+                .pending_events("peer-replica", 10)
+                .expect("acked events")
+                .is_empty()
+        );
+
+        assert!(
+            receive_exchange(
+                &store,
+                SyncRequest {
+                    source_replica_id: "peer-replica".into(),
+                    remote_cursor: 2,
+                    events: Vec::new(),
+                },
+            )
+            .is_err()
+        );
     }
 }

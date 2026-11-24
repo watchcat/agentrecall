@@ -29,21 +29,31 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
-struct SqlMigration {
-    version: i64,
-    sql: &'static str,
+pub(crate) struct SqlMigration {
+    pub(crate) version: i64,
+    pub(crate) sql: &'static str,
 }
 
-const MIGRATIONS: &[SqlMigration] = &[SqlMigration {
-    version: 1,
-    sql: include_str!("../migrations/001_init.sql"),
-}];
+pub(crate) const MIGRATIONS: &[SqlMigration] = &[
+    SqlMigration {
+        version: 1,
+        sql: include_str!("../migrations/001_init.sql"),
+    },
+    SqlMigration {
+        version: 2,
+        sql: include_str!("../migrations/002_retention.sql"),
+    },
+    SqlMigration {
+        version: 3,
+        sql: include_str!("../migrations/003_current_version_snapshot.sql"),
+    },
+];
 
-fn migration_checksum(sql: &str) -> String {
+pub(crate) fn migration_checksum(sql: &str) -> String {
     hex::encode(Sha256::digest(sql.as_bytes()))
 }
 
-fn apply_migrations(
+pub(crate) fn apply_migrations(
     connection: &mut Connection,
     migrations: &[SqlMigration],
 ) -> anyhow::Result<()> {
@@ -217,6 +227,16 @@ pub struct OperationalSnapshot {
 pub struct SearchPage {
     pub offset: usize,
     pub limit: usize,
+}
+
+pub const EVENT_LOG_RETENTION_DAYS: i64 = 90;
+pub const EVENT_LOG_MAX_EVENTS_PER_ORIGIN: i64 = 100_000;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CollectionSummary {
+    pub expired_records: usize,
+    pub purged_mutation_events: usize,
+    pub purged_applied_events: usize,
 }
 
 pub struct SearchRequest<'a> {
@@ -517,6 +537,96 @@ impl Store {
             )
             .map_err(storage_error)?;
         Ok(())
+    }
+
+    /// Turn expired live records into replicated tombstones and compact safe event-log prefixes.
+    pub fn collect_expired_and_compact(&self) -> Result<CollectionSummary, AppError> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction().map_err(storage_error)?;
+        let expired = {
+            let mut statement = tx
+                .prepare(
+                    "SELECT m.owner_id,m.memory_id,m.namespace,m.revision,m.version_event_id,m.expires_at
+                     FROM memories m
+                     WHERE m.deleted_at IS NULL AND m.memory_json IS NOT NULL
+                       AND m.expires_at IS NOT NULL
+                       AND TRY_CAST(m.expires_at AS TIMESTAMPTZ) <= CURRENT_TIMESTAMP
+                       AND NOT EXISTS (
+                           SELECT 1 FROM replication_conflicts c
+                           WHERE c.owner_id=m.owner_id AND c.memory_id=m.memory_id
+                       )
+                     ORDER BY m.owner_id,m.namespace,m.memory_id",
+                )
+                .map_err(storage_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })
+                .map_err(storage_error)?;
+            rows.collect::<duckdb::Result<Vec<_>>>()
+                .map_err(storage_error)?
+        };
+        let collected_at = now_rfc3339();
+        let mut affected_scopes = Vec::new();
+        for (owner_id, memory_id, namespace, revision, base_event_id, expires_at) in &expired {
+            let revision = revision
+                .checked_add(1)
+                .ok_or(AppError::TemporarilyUnavailable)?;
+            let event_id = Uuid::now_v7().to_string();
+            let sequence = next_sequence(&tx).map_err(storage_error)?;
+            let tombstone = Tombstone {
+                memory_id: memory_id.clone(),
+                namespace: namespace.clone(),
+                revision,
+                deleted_at: expires_at.clone(),
+                version_event_id: event_id.clone(),
+            };
+            // Persist the latest event envelope with canonical state before history compaction.
+            let event = MutationEvent {
+                event_id,
+                origin_replica_id: self.replica_id().to_owned(),
+                origin_seq: sequence,
+                owner_id: owner_id.clone(),
+                client_id: "agentrecall-retention-collector".to_owned(),
+                memory_id: memory_id.clone(),
+                namespace: namespace.clone(),
+                operation: MutationOperation::Delete,
+                base_event_id: base_event_id.clone(),
+                payload: MutationPayload::Tombstone(tombstone),
+                created_at: collected_at.clone(),
+                idempotency: None,
+            };
+            write_current_version(&tx, &event).map_err(storage_error)?;
+            append_event(&tx, &event).map_err(storage_error)?;
+            tx.execute(
+                "DELETE FROM memory_embeddings WHERE owner_id=? AND namespace=? AND memory_id=?",
+                params![owner_id, namespace, memory_id],
+            )
+            .map_err(storage_error)?;
+            let scope = (owner_id.clone(), namespace.clone());
+            if !affected_scopes.contains(&scope) {
+                affected_scopes.push(scope);
+            }
+        }
+        let (purged_mutation_events, purged_applied_events) =
+            compact_event_log(&tx, self.replica_id()).map_err(storage_error)?;
+        tx.commit().map_err(storage_error)?;
+        for (owner_id, namespace) in affected_scopes {
+            self.refresh_fts_scope(&mut connection, &owner_id, &namespace);
+            self.refresh_embeddings_scope(&connection, &owner_id, &namespace);
+        }
+        Ok(CollectionSummary {
+            expired_records: expired.len(),
+            purged_mutation_events,
+            purged_applied_events,
+        })
     }
 
     /// Enable semantic search with an explicitly supplied local/in-process adapter.
@@ -1032,7 +1142,6 @@ impl Store {
         memory.source_client = auth.client_id.clone();
         let event_id = Uuid::now_v7().to_string();
         let sequence = next_sequence(&tx).map_err(storage_error)?;
-        write_memory(&tx, &auth.owner_id, &memory, &event_id).map_err(storage_error)?;
         let idempotency = request_id.map(|request_id| IdempotencyEntry {
             client_id: auth.client_id.clone(),
             client_request_id: request_id.to_owned(),
@@ -1053,6 +1162,7 @@ impl Store {
             created_at: now_rfc3339(),
             idempotency,
         };
+        write_current_version(&tx, &event).map_err(storage_error)?;
         append_event(&tx, &event).map_err(storage_error)?;
         if let Some(entry) = &event.idempotency {
             tx.execute(
@@ -1398,7 +1508,6 @@ impl Store {
         memory.revision += 1;
         let event_id = Uuid::now_v7().to_string();
         let sequence = next_sequence(&tx).map_err(storage_error)?;
-        write_memory(&tx, &auth.owner_id, &memory, &event_id).map_err(storage_error)?;
         let event = MutationEvent {
             event_id: event_id.clone(),
             origin_replica_id: self.replica_id().to_owned(),
@@ -1413,6 +1522,7 @@ impl Store {
             created_at: now_rfc3339(),
             idempotency: None,
         };
+        write_current_version(&tx, &event).map_err(storage_error)?;
         append_event(&tx, &event).map_err(storage_error)?;
         tx.commit().map_err(storage_error)?;
         self.refresh_fts_scope(&mut connection, &auth.owner_id, &memory.namespace);
@@ -1456,10 +1566,6 @@ impl Store {
         let deleted_at = now_rfc3339();
         let next_revision = revision + 1;
         let sequence = next_sequence(&tx).map_err(storage_error)?;
-        tx.execute(
-            "UPDATE memories SET memory_json=NULL,content=NULL,title=NULL,tags=NULL,expires_at=NULL,deleted_at=?,revision=?,version_event_id=? WHERE owner_id=? AND memory_id=? AND namespace=?",
-            params![deleted_at, next_revision, event_id, auth.owner_id, memory_id, namespace],
-        ).map_err(storage_error)?;
         let tombstone = Tombstone {
             memory_id: memory_id.to_owned(),
             namespace: namespace.to_owned(),
@@ -1481,6 +1587,7 @@ impl Store {
             created_at: deleted_at,
             idempotency: None,
         };
+        write_current_version(&tx, &event).map_err(storage_error)?;
         append_event(&tx, &event).map_err(storage_error)?;
         tx.commit().map_err(storage_error)?;
         self.refresh_fts_scope(&mut connection, &auth.owner_id, namespace);
@@ -1519,6 +1626,11 @@ impl Store {
             .optional()
             .map_err(storage_error)?
             .unwrap_or(0);
+        let pruned_through =
+            event_log_watermark(&connection, self.replica_id()).map_err(storage_error)?;
+        if ack < pruned_through {
+            return Err(AppError::TemporarilyUnavailable);
+        }
         let mut statement = connection.prepare("SELECT event_json FROM mutation_log WHERE origin_replica_id=? AND origin_seq>? ORDER BY origin_seq LIMIT ?").map_err(storage_error)?;
         let rows = statement
             .query_map(params![self.replica_id(), ack, limit as i64], |row| {
@@ -1535,6 +1647,11 @@ impl Store {
 
     pub fn events_after(&self, cursor: i64, limit: usize) -> Result<Vec<MutationEvent>, AppError> {
         let connection = self.lock()?;
+        let pruned_through =
+            event_log_watermark(&connection, self.replica_id()).map_err(storage_error)?;
+        if cursor < pruned_through || cursor < 0 {
+            return Err(AppError::TemporarilyUnavailable);
+        }
         let mut statement = connection.prepare("SELECT event_json FROM mutation_log WHERE origin_replica_id=? AND origin_seq>? ORDER BY origin_seq LIMIT ?").map_err(storage_error)?;
         let rows = statement
             .query_map(params![self.replica_id(), cursor, limit as i64], |row| {
@@ -1769,16 +1886,13 @@ impl Store {
             idempotency: None,
         };
         match &payload {
-            MutationPayload::Record(record) => {
-                write_memory(&tx, owner_id, record, &event_id).map_err(storage_error)?
-            }
-            MutationPayload::Tombstone(tombstone) => {
-                tx.execute(
-                    "INSERT INTO memories(owner_id,memory_id,namespace,memory_json,content,title,tags,expires_at,deleted_at,revision,version_event_id) VALUES (?,?,?,NULL,NULL,NULL,NULL,NULL,?,?,?) ON CONFLICT(owner_id,memory_id) DO UPDATE SET namespace=excluded.namespace,memory_json=NULL,content=NULL,title=NULL,tags=NULL,expires_at=NULL,deleted_at=excluded.deleted_at,revision=excluded.revision,version_event_id=excluded.version_event_id",
-                    params![owner_id,memory_id,namespace,tombstone.deleted_at,tombstone.revision,event_id],
-                ).map_err(storage_error)?;
-            }
+            MutationPayload::Record(record)
+                if record.id == memory_id && record.namespace == namespace => {}
+            MutationPayload::Tombstone(tombstone)
+                if tombstone.memory_id == memory_id && tombstone.namespace == namespace => {}
+            _ => return Err(AppError::TemporarilyUnavailable),
         }
+        write_current_version(&tx, &event).map_err(storage_error)?;
         let branch_ids: Vec<&str> = branches
             .iter()
             .map(|branch| branch.event_id.as_str())
@@ -1798,6 +1912,124 @@ impl Store {
         self.refresh_embeddings_scope(&connection, owner_id, &namespace);
         Ok(event)
     }
+}
+
+fn event_log_watermark(connection: &Connection, origin_replica_id: &str) -> duckdb::Result<i64> {
+    connection
+        .query_row(
+            "SELECT pruned_through FROM event_log_watermarks WHERE origin_replica_id=?",
+            params![origin_replica_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(0))
+}
+
+fn compact_event_log(
+    tx: &Transaction<'_>,
+    local_replica_id: &str,
+) -> duckdb::Result<(usize, usize)> {
+    let local_sequence: i64 = tx.query_row(
+        "SELECT CAST(value AS BIGINT) FROM service_meta WHERE key='local_sequence'",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut origins = vec![local_replica_id.to_owned()];
+    {
+        let mut statement = tx.prepare(
+            "SELECT origin_replica_id FROM mutation_log
+             UNION SELECT origin_replica_id FROM event_log_watermarks",
+        )?;
+        for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+            let origin = row?;
+            if !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+    }
+
+    let cutoff = Utc::now() - chrono::Duration::days(EVENT_LOG_RETENTION_DAYS);
+    let mut purged_events = 0usize;
+    let mut purged_applied = 0usize;
+    for origin in origins {
+        let high_watermark = if origin == local_replica_id {
+            local_sequence
+        } else {
+            tx.query_row(
+                "SELECT inbound_cursor FROM replica_state WHERE peer_replica_id=?",
+                params![origin],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+        };
+        let pruned_through = tx
+            .query_row(
+                "SELECT pruned_through FROM event_log_watermarks WHERE origin_replica_id=?",
+                params![origin],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if high_watermark <= pruned_through {
+            continue;
+        }
+
+        // Age/count retention does not wait for peer acknowledgements. Peers below this
+        // watermark are rejected and must be re-seeded from a verified current-state copy.
+        let count_through = high_watermark.saturating_sub(EVENT_LOG_MAX_EVENTS_PER_ORIGIN);
+        let mut age_through = pruned_through;
+        let mut contiguous_through = pruned_through;
+        let mut expected_sequence = pruned_through.saturating_add(1);
+        {
+            let mut statement = tx.prepare(
+                "SELECT origin_seq,created_at FROM mutation_log
+                 WHERE origin_replica_id=? AND origin_seq>? ORDER BY origin_seq",
+            )?;
+            for row in statement.query_map(params![origin, pruned_through], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (sequence, created_at) = row?;
+                if sequence != expected_sequence || sequence > high_watermark {
+                    break;
+                }
+                contiguous_through = sequence;
+                expected_sequence = sequence.saturating_add(1);
+                let old_enough = DateTime::parse_from_rfc3339(&created_at)
+                    .ok()
+                    .is_some_and(|created| created.with_timezone(&Utc) < cutoff);
+                if old_enough {
+                    // Prune through the highest expired sequence. Removing the whole prefix
+                    // keeps the replication feed contiguous even if timestamps are out of order.
+                    age_through = sequence;
+                }
+            }
+        }
+        let candidate = age_through.max(count_through);
+        let through = candidate.min(contiguous_through);
+        if through <= pruned_through {
+            continue;
+        }
+
+        purged_events += tx.execute(
+            "DELETE FROM mutation_log
+             WHERE origin_replica_id=? AND origin_seq>? AND origin_seq<=?",
+            params![origin, pruned_through, through],
+        )?;
+        purged_applied += tx.execute(
+            "DELETE FROM applied_events WHERE origin_replica_id=? AND origin_seq<=?",
+            params![origin, through],
+        )?;
+        tx.execute(
+            "INSERT INTO event_log_watermarks(origin_replica_id,pruned_through,updated_at)
+             VALUES (?,?,?)
+             ON CONFLICT(origin_replica_id) DO UPDATE SET
+                 pruned_through=GREATEST(event_log_watermarks.pruned_through,excluded.pruned_through),
+                 updated_at=excluded.updated_at",
+            params![origin, through, now_rfc3339()],
+        )?;
+    }
+    Ok((purged_events, purged_applied))
 }
 
 fn combine_relevance(lexical: Option<f32>, semantic: Option<f32>) -> Option<f32> {
@@ -2223,17 +2455,23 @@ fn append_event(tx: &Transaction<'_>, event: &MutationEvent) -> duckdb::Result<(
     Ok(())
 }
 
-fn write_memory(
-    tx: &Transaction<'_>,
-    owner_id: &str,
-    memory: &Memory,
-    version_event_id: &str,
-) -> duckdb::Result<()> {
-    let json = serde_json::to_string(memory).unwrap_or_default();
-    tx.execute(
-        "INSERT INTO memories(owner_id,memory_id,namespace,memory_json,content,title,tags,expires_at,deleted_at,revision,version_event_id) VALUES (?,?,?,?,?,?,?, ?,NULL,?,?) ON CONFLICT(owner_id,memory_id) DO UPDATE SET namespace=excluded.namespace,memory_json=excluded.memory_json,content=excluded.content,title=excluded.title,tags=excluded.tags,expires_at=excluded.expires_at,deleted_at=NULL,revision=excluded.revision,version_event_id=excluded.version_event_id",
-        params![owner_id, memory.id, memory.namespace, json, memory.content, memory.title, memory.tags.join(" "), memory.expires_at, memory.revision, version_event_id],
-    )?;
+fn write_current_version(tx: &Transaction<'_>, event: &MutationEvent) -> duckdb::Result<()> {
+    let event_json = serde_json::to_string(event).unwrap_or_default();
+    match &event.payload {
+        MutationPayload::Record(memory) => {
+            let memory_json = serde_json::to_string(memory).unwrap_or_default();
+            tx.execute(
+                "INSERT INTO memories(owner_id,memory_id,namespace,memory_json,content,title,tags,expires_at,deleted_at,revision,version_event_id,current_version_event_json) VALUES (?,?,?,?,?,?,?, ?,NULL,?,?,?) ON CONFLICT(owner_id,memory_id) DO UPDATE SET namespace=excluded.namespace,memory_json=excluded.memory_json,content=excluded.content,title=excluded.title,tags=excluded.tags,expires_at=excluded.expires_at,deleted_at=NULL,revision=excluded.revision,version_event_id=excluded.version_event_id,current_version_event_json=excluded.current_version_event_json",
+                params![event.owner_id, memory.id, memory.namespace, memory_json, memory.content, memory.title, memory.tags.join(" "), memory.expires_at, memory.revision, event.event_id, event_json],
+            )?;
+        }
+        MutationPayload::Tombstone(tombstone) => {
+            tx.execute(
+                "INSERT INTO memories(owner_id,memory_id,namespace,memory_json,content,title,tags,expires_at,deleted_at,revision,version_event_id,current_version_event_json) VALUES (?,?,?,NULL,NULL,NULL,NULL,NULL,?,?,?,?) ON CONFLICT(owner_id,memory_id) DO UPDATE SET namespace=excluded.namespace,memory_json=NULL,content=NULL,title=NULL,tags=NULL,expires_at=NULL,deleted_at=excluded.deleted_at,revision=excluded.revision,version_event_id=excluded.version_event_id,current_version_event_json=excluded.current_version_event_json",
+                params![event.owner_id, tombstone.memory_id, tombstone.namespace, tombstone.deleted_at, tombstone.revision, event.event_id, event_json],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -2308,6 +2546,32 @@ fn apply_event(tx: &Transaction<'_>, event: &MutationEvent) -> duckdb::Result<()
     if already_current {
         return Ok(());
     }
+    if matches!(&event.operation, MutationOperation::Delete)
+        && matches!(&event.payload, MutationPayload::Tombstone(_))
+        && event.base_event_id.is_some()
+        && let Some((Some(current_event_id), Some(_))) = current.as_ref()
+        && let Some(current_json) = tx
+            .query_row(
+                "SELECT current_version_event_json FROM memories WHERE version_event_id=?",
+                params![current_event_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+    {
+        let current_event: MutationEvent =
+            serde_json::from_str(&current_json).map_err(|error| {
+                duckdb::Error::FromSqlConversionFailure(
+                    0,
+                    duckdb::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+        if matches!(&current_event.operation, MutationOperation::Delete)
+            && current_event.base_event_id == event.base_event_id
+        {
+            return Ok(());
+        }
+    }
     let conflict_exists = tx
         .query_row(
             "SELECT branches_json FROM replication_conflicts WHERE owner_id=? AND memory_id=?",
@@ -2345,16 +2609,13 @@ fn apply_event(tx: &Transaction<'_>, event: &MutationEvent) -> duckdb::Result<()
             MutationPayload::Record(memory)
                 if memory.id == event.memory_id && memory.namespace == event.namespace =>
             {
-                write_memory(tx, &event.owner_id, memory, &event.event_id)?
+                write_current_version(tx, event)?
             }
             MutationPayload::Tombstone(tombstone)
                 if tombstone.memory_id == event.memory_id
                     && tombstone.namespace == event.namespace =>
             {
-                tx.execute(
-                    "INSERT INTO memories(owner_id,memory_id,namespace,memory_json,content,title,tags,expires_at,deleted_at,revision,version_event_id) VALUES (?,?,?,NULL,NULL,NULL,NULL,NULL,?,?,?) ON CONFLICT(owner_id,memory_id) DO UPDATE SET namespace=excluded.namespace,memory_json=NULL,content=NULL,title=NULL,tags=NULL,expires_at=NULL,deleted_at=excluded.deleted_at,revision=excluded.revision,version_event_id=excluded.version_event_id",
-                    params![event.owner_id,tombstone.memory_id,tombstone.namespace,tombstone.deleted_at,tombstone.revision,event.event_id],
-                )?;
+                write_current_version(tx, event)?;
             }
             _ => {
                 return Err(duckdb::Error::ToSqlConversionFailure(Box::new(
@@ -2387,15 +2648,8 @@ fn apply_event(tx: &Transaction<'_>, event: &MutationEvent) -> duckdb::Result<()
     };
     if causally_applies && conflict_exists.is_none() {
         match &event.payload {
-            MutationPayload::Record(memory) => {
-                write_memory(tx, &event.owner_id, memory, &event.event_id)?
-            }
-            MutationPayload::Tombstone(tombstone) => {
-                tx.execute(
-                    "INSERT INTO memories(owner_id,memory_id,namespace,memory_json,content,title,tags,expires_at,deleted_at,revision,version_event_id) VALUES (?,?,?,NULL,NULL,NULL,NULL,NULL,?,?,?) ON CONFLICT(owner_id,memory_id) DO UPDATE SET namespace=excluded.namespace,memory_json=NULL,content=NULL,title=NULL,tags=NULL,expires_at=NULL,deleted_at=excluded.deleted_at,revision=excluded.revision,version_event_id=excluded.version_event_id",
-                    params![event.owner_id, tombstone.memory_id, tombstone.namespace, tombstone.deleted_at, tombstone.revision, event.event_id],
-                )?;
-            }
+            MutationPayload::Record(_) => write_current_version(tx, event)?,
+            MutationPayload::Tombstone(_) => write_current_version(tx, event)?,
         }
     } else {
         let mut branches: Vec<MutationEvent> = match conflict_exists {
@@ -2417,7 +2671,7 @@ fn apply_event(tx: &Transaction<'_>, event: &MutationEvent) -> duckdb::Result<()
         } else {
             let namespace = event.namespace.clone();
             if let Some(version) = current_version {
-                let existing_branch = tx.query_row("SELECT event_json FROM mutation_log WHERE event_id=?", params![version], |row| row.get::<_,String>(0)).optional()?;
+                let existing_branch = tx.query_row("SELECT current_version_event_json FROM memories WHERE version_event_id=?", params![version], |row| row.get::<_,String>(0)).optional()?;
                 if let Some(json) = existing_branch
                     && let Ok(branch) = serde_json::from_str::<MutationEvent>(&json)
                 {
@@ -2462,7 +2716,10 @@ mod tests {
                 row.get(0)
             })
             .expect("legacy history");
-        assert_eq!(count, 1);
+        assert_eq!(
+            count, 3,
+            "opening the legacy schema applies retention and current-version snapshot migrations"
+        );
     }
 
     #[test]
@@ -2585,6 +2842,180 @@ mod tests {
                 .expect("reopened metrics")
                 .last_successful_sync_at
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn retention_collection_tombstones_expired_records_and_removes_derived_embeddings() {
+        let directory = tempdir().expect("temporary directory");
+        let store = Store::open(
+            &directory.path().join("expiry.duckdb"),
+            "expiry-replica",
+            100,
+        )
+        .expect("open store");
+        let owner = auth("owner", "cue");
+        let mut expired = record("expired secret text");
+        expired.expires_at = Some("2000-01-01T00:00:00Z".into());
+        let (saved, _) = store
+            .save_record(&owner, expired, None, "")
+            .expect("save expired memory");
+        {
+            let connection = store.lock().expect("lock store");
+            connection
+                .execute(
+                    "INSERT INTO memory_embeddings(owner_id,namespace,memory_id,model_name,model_version,dimension,revision,embedding_json) VALUES (?,?,?,?,?,?,?,?)",
+                    params!["owner", "shared", saved.id, "test", "1", 3, saved.revision, "[1.0,0.0,0.0]"],
+                )
+                .expect("insert derived embedding");
+        }
+
+        let summary = store
+            .collect_expired_and_compact()
+            .expect("collect expired record");
+        assert_eq!(summary.expired_records, 1);
+        assert!(
+            store
+                .get_record(&owner, &saved.id, "shared")
+                .expect("get deleted record")
+                .is_none()
+        );
+        let connection = store.lock().expect("lock store");
+        let embeddings: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE memory_id=?",
+                params![saved.id],
+                |row| row.get(0),
+            )
+            .expect("count derived embeddings");
+        assert_eq!(embeddings, 0);
+        let tombstone_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM mutation_log WHERE memory_id=? AND operation='\"delete\"'",
+                params![saved.id],
+                |row| row.get(0),
+            )
+            .expect("count deletion tombstones");
+        assert_eq!(tombstone_count, 1);
+    }
+
+    #[test]
+    fn retention_prunes_aged_history_for_stale_peers_and_preserves_current_state() {
+        let directory = tempdir().expect("temporary directory");
+        let database = directory.path().join("compaction.duckdb");
+        let store = Store::open(&database, "compact-replica", 100).expect("open store");
+        let owner = auth("owner", "cue");
+        let (created, _) = store
+            .save_record(&owner, record("original content"), None, "")
+            .expect("save original");
+        store
+            .update_record(
+                &owner,
+                &created.id,
+                "shared",
+                created.revision,
+                UpdatePatch {
+                    content: Some("replacement content".into()),
+                    title: None,
+                    kind: None,
+                    tags: None,
+                    confidence: None,
+                    importance: None,
+                    expires_at: None,
+                },
+            )
+            .expect("update record");
+        store
+            .acknowledge_outbound("peer-replica", 1)
+            .expect("create a peer cursor older than the eventual watermark");
+
+        let old_timestamp = "2000-01-01T00:00:00Z";
+        let events = store.events_after(0, 10).expect("read local events");
+        let latest_event_id = events.last().expect("latest event").event_id.clone();
+        let connection = store.lock().expect("lock store");
+        for mut event in events {
+            event.created_at = old_timestamp.into();
+            connection
+                .execute(
+                    "UPDATE mutation_log SET created_at=?,event_json=? WHERE event_id=?",
+                    params![
+                        old_timestamp,
+                        serde_json::to_string(&event).expect("serialize old event"),
+                        event.event_id
+                    ],
+                )
+                .expect("age mutation event");
+        }
+        drop(connection);
+
+        let summary = store
+            .collect_expired_and_compact()
+            .expect("compact the expired event prefix");
+        assert_eq!(summary.purged_mutation_events, 2);
+        assert!(
+            store.events_after(1, 10).is_err(),
+            "an inbound cursor below the watermark must require re-seeding"
+        );
+        assert!(
+            store.pending_events("peer-replica", 10).is_err(),
+            "an unacknowledged outbound peer below the watermark must fail closed"
+        );
+
+        let connection = store.lock().expect("lock compacted store");
+        let watermark: i64 = connection
+            .query_row(
+                "SELECT pruned_through FROM event_log_watermarks WHERE origin_replica_id='compact-replica'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read local watermark");
+        assert_eq!(watermark, 2);
+        let retained: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM mutation_log WHERE origin_replica_id='compact-replica'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count retained events");
+        assert_eq!(
+            retained, 0,
+            "even the current version's history row expires"
+        );
+        let (memory_json, snapshot_json): (String, String) = connection
+            .query_row(
+                "SELECT memory_json,current_version_event_json FROM memories WHERE owner_id=? AND memory_id=?",
+                params![owner.owner_id, created.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read canonical current record and event snapshot");
+        let current: Memory = serde_json::from_str(&memory_json).expect("decode current memory");
+        assert_eq!(current.content, "replacement content");
+        let snapshot: MutationEvent =
+            serde_json::from_str(&snapshot_json).expect("decode current event snapshot");
+        assert_eq!(snapshot.event_id, latest_event_id);
+        assert!(matches!(
+            snapshot.payload,
+            MutationPayload::Record(ref memory) if memory.content == "replacement content"
+        ));
+        drop(connection);
+        drop(store);
+        let backup = directory.path().join("current-state.backup.duckdb");
+        let restored_path = directory.path().join("current-state.restored.duckdb");
+        let backed_up = crate::backup::backup_database(&database, &backup)
+            .expect("back up current state after pruning its history row");
+        let restored = crate::backup::restore_database(&backup, &restored_path, true)
+            .expect("restore the verified current-state snapshot");
+        assert_eq!(restored, backed_up);
+        let reloaded = Store::open(&restored_path, "compact-replica", 100)
+            .expect("open restored snapshot with its original identity");
+        let current = reloaded
+            .get_record(&owner, &created.id, "shared")
+            .expect("read restored canonical current record")
+            .expect("current record remains present");
+        assert_eq!(current.content, "replacement content");
+        assert!(
+            reloaded.pending_events("peer-replica", 10).is_err(),
+            "restore preserves the stale peer cursor; operator re-seed is still required"
         );
     }
 

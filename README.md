@@ -5,14 +5,14 @@
 
 AgentRecall is a self-hostable shared-memory service for AI agents and applications. It is written in Rust and exposes memory operations over MCP Streamable HTTP, with an embedded DuckDB database owned by each service instance. Clients use the service API; they never open database files directly.
 
-> **Status: prototype.** On Rust 1.100.0, `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets` (26 passed), strict Clippy, the release build, and CLI `--help` passed locally. A real local BGE-M3 smoke test initialized the model, saved a Cantonese memory, and retrieved it with an English query. That service run had no VSS extension, so it used exact owner/namespace-scoped vector scoring; it did not exercise HNSW. Two-node replication acceptance, live Cue/Hermes integration, and production deployment/security checks remain. See [implementation status and release gates](docs/implementation-status.md).
+> **Status: prototype.** On Rust 1.100.0, `cargo fmt --check`, `cargo check --all-targets`, the 45-test `cargo test --all-targets` suite, strict Clippy, and CLI help passed locally; the release build passed in the prior validation. A real local BGE-M3 smoke test initialized the model, saved a Cantonese memory, and retrieved it with an English query. That service run had no VSS extension, so it used exact owner/namespace-scoped vector scoring; it did not exercise HNSW. Two-node replication acceptance, live Cue/Hermes integration, and production deployment/security checks remain. See [implementation status and release gates](docs/implementation-status.md).
 
 ## What it provides
 
 - Five MCP tools: `memory_search`, `memory_get`, `memory_save`, `memory_update`, and `memory_delete`.
 - Per-client bearer credentials, owner and namespace authorization, scoped permissions, origin/host checks, request limits, and rate limiting.
-- Durable records, optimistic revision checks, idempotent saves, tombstones, and signed, filter-bound search cursors.
-- Local-initiated replication between independent database instances, with idempotent event application and explicit retention/resolution of concurrent branches.
+- Durable records, optimistic revision checks, idempotent saves, tombstones, expiry collection, and signed, filter-bound search cursors.
+- Local-initiated replication between independent database instances, with idempotent event application, safe event-log watermarks, and explicit retention/resolution of concurrent branches.
 - Lexical search remains available without optional extensions; DuckDB FTS/BM25 and semantic search are implemented. The local BGE-M3 provider smoke passed, using exact scoped-vector fallback because VSS was not installed.
 - An optional loopback-only router for Hermes that prefers the local service and uses the cloud route only under narrowly defined connection-failure conditions.
 
@@ -96,7 +96,9 @@ cargo run --release -- install-vss
 
 FTS accelerates lexical retrieval. The semantic search path is covered by a deterministic test adapter, and actual local BGE-M3 inference was smoke-tested through an isolated service: it saved a Cantonese memory and retrieved it with an English query. VSS was not installed for that run, so retrieval used exact owner/namespace-scoped vector scoring and did not exercise HNSW. With VSS provisioned, AgentRecall can persist model/version-tagged derived vectors and build per-owner/per-namespace HNSW indexes in memory. Without an embedding adapter, search remains lexical. Expired and deleted records are removed from derived search projections as part of retrieval and mutation handling.
 
-The local replica initiates HTTPS exchanges with the cloud endpoint when `AGENTRECALL_PEER_URL`, `AGENTRECALL_PEER_TOKEN`, and `AGENTRECALL_PEER_REPLICA_ID` are configured. Replication credentials are separate from MCP client credentials. Delivery is at-least-once and event application is idempotent. Conflicts require an operator to inspect retained branches and explicitly resolve them; see [operations](docs/operations.md).
+The local replica initiates HTTPS exchanges with the cloud endpoint when `AGENTRECALL_PEER_URL`, `AGENTRECALL_PEER_TOKEN`, and `AGENTRECALL_PEER_REPLICA_ID` are configured. Replication credentials are separate from MCP client credentials. Delivery is at-least-once and event application is idempotent. The hourly collector emits tombstones for expired records and enforces a fixed 90-day maximum mutation-history window, with a fixed 100,000-event-per-origin cap that can prune earlier; neither value is runtime-configurable. Compaction does not wait for peer acknowledgements. It retains each record's current version envelope with canonical state; a stale peer below the pruning watermark is rejected and needs operator-led re-seeding from a verified current-state snapshot; restarting alone cannot restore pruned history. Conflicts require an operator to inspect retained branches and explicitly resolve them.
+
+Operators can create a checkpointed database backup and restore only to a new, verified destination with `agentrecall backup --database ... --output ...` and `agentrecall restore --backup ... --database ... --verify`. Review [deletion and retention](docs/operations.md#deletion-and-retention), [backup/restore](docs/operations.md#backup-and-restore), and the [acceptance checks](docs/operations.md#acceptance-evidence) before rollout.
 
 ## Security and production limits
 
@@ -106,4 +108,4 @@ The local replica initiates HTTPS exchanges with the cloud endpoint when `AGENTR
 - The service logs operational metadata, not memory content or bearer headers; review deployment logging and retention as part of acceptance.
 - Encrypt backups at rest and test restore procedures independently for each replica.
 
-The earlier 25-test core suite does not verify the current FastEmbed/DuckDB project build or real BGE-M3 inference. It also does not verify production availability, cloud TLS, real client interoperability, embedding quality/performance, backup recovery, or two-node restart/disconnection acceptance. Complete the remaining [release gates](docs/implementation-status.md) before relying on a public deployment.
+The current 45-test local suite exercises retention collection, age/count-bounded event-log compaction independent of peer acknowledgements, current-state preservation, stale-cursor refusal, and verified backup/restore on test databases. Local builds and a BGE-M3 smoke test still do not verify production availability, cloud TLS, real client interoperability, embedding quality/performance at scale, or two-node restart/disconnection acceptance. Complete the remaining [release gates](docs/implementation-status.md) before relying on a public deployment.

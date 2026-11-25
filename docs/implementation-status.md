@@ -18,7 +18,7 @@ Before the BGE-M3 provider and Rust 1.100 migration, the core checks passed: `ca
 
 ## Current BGE-M3 and Rust status
 
-The current source passed Rust 1.100.0 validation on the Mac mini: `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets` (45 passed), strict all-target/all-feature Clippy, and CLI `--help`. The release build passed in an earlier validation. Dependency audit results below refer to an earlier audited checkpoint and were not re-run against this current source state.
+The reported final acceptance run on Rust 1.100.0 passed 57 tests with `cargo test --all-targets`. The current source also passed `cargo fmt --check`, `cargo check --all-targets`, strict all-target/all-feature Clippy, and CLI `--help`. The release build passed in an earlier validation. Dependency audit results below refer to an earlier audited checkpoint and were not re-run against this current source state.
 
 ### Dependency advisory notes from the earlier audit
 
@@ -34,7 +34,7 @@ VSS was not installed for that service run. Semantic retrieval therefore used ex
 
 ## Backup, retention, and replication recovery coverage
 
-The current 45-test suite includes automated coverage on disposable databases for:
+The current 57-test suite includes automated coverage on disposable databases for:
 
 - Two-database replicas exchanging changes, then recovering through a restart/partition scenario while maintaining owner and namespace isolation. A separate test exercises the trusted HTTPS replication worker path.
 - Age- and count-bounded mutation-log compaction, preservation of canonical current state and current-version envelopes, and atomic rejection of stale-watermark exchanges before valid inbound events are applied or either cursor advances.

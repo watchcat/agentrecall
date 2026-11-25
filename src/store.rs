@@ -3540,14 +3540,16 @@ mod tests {
             )
             .expect("count expired persisted embeddings");
         assert_eq!(persisted_count, 0, "expired embedding cache is removed");
-        let fts_count: i64 = connection
-            .query_row(
-                &format!("SELECT COUNT(*) FROM {fts_table} WHERE document_id=?"),
-                params![expired.id],
-                |row| row.get(0),
-            )
-            .expect("count expired FTS documents");
-        assert_eq!(fts_count, 0, "expired FTS document is removed");
+        if store.fts_available() {
+            let fts_count: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {fts_table} WHERE document_id=?"),
+                    params![expired.id],
+                    |row| row.get(0),
+                )
+                .expect("count expired FTS documents");
+            assert_eq!(fts_count, 0, "expired FTS document is removed");
+        }
         let vector_connection = store
             .vector_connection
             .lock()

@@ -6,7 +6,8 @@
 # optional Hermes router, both bound to 127.0.0.1, with no replication peer.
 # For the two-node local+cloud topology see docs/deployment.md instead.
 #
-# Everything the script writes stays under one prefix directory. Secrets are
+# Application files and secrets stay under one prefix; supervisor files are
+# written to the standard per-user launchd/systemd directories. Secrets are
 # generated locally, stored 0600, and never printed. The client bearer token
 # is shown once by `agentrecall create-token`, so the script captures it into a
 # 0600 file rather than echoing it to a log.
@@ -131,6 +132,52 @@ probe_host() {
         0.0.0.0:*|:*|"") printf '127.0.0.1' ;;
         *) printf '%s' "${1%%:*}" ;;
     esac
+}
+
+validate_loopback_bind() {
+    label="$1"
+    address="$2"
+    case "$address" in
+        127.0.0.1:*) port="${address#*:}" ;;
+        *) die "$label must bind to 127.0.0.1 (got '$address')" ;;
+    esac
+    case "$port" in
+        ''|*[!0-9]*) die "$label must include a numeric port from 1 to 65535" ;;
+    esac
+    [ "${#port}" -le 5 ] || die "$label port must be from 1 to 65535"
+    port_number=$((10#$port))
+    if [ "$port_number" -lt 1 ] || [ "$port_number" -gt 65535 ]; then
+        die "$label port must be from 1 to 65535"
+    fi
+}
+
+physical_dir() {
+    (CDPATH='' cd -P -- "$1" 2>/dev/null && pwd -P)
+}
+
+validate_prefix_directory() {
+    [ -n "$PREFIX" ] || die "installation prefix must not be empty"
+    prefix_real="$(physical_dir "$PREFIX")" || die "cannot resolve installation prefix: $PREFIX"
+    home_real="$(physical_dir "$HOME")" || die "cannot resolve home directory: $HOME"
+    [ "$prefix_real" != "/" ] || die "refusing to use the filesystem root as the installation prefix"
+    case "$home_real" in
+        "$prefix_real"|"$prefix_real"/*)
+            die "refusing to use the home directory or one of its ancestors as the installation prefix"
+            ;;
+    esac
+    case "$prefix_real" in
+        /tmp|/private/tmp|/var|/private/var|/var/tmp|/private/var/tmp|/usr|/usr/local|/opt|/etc|/home|/Users|/root|/workspace|/System|/Library|/Applications|"$home_real/.local"|"$home_real/.local/share"|"$home_real/.config"|"$home_real/Library")
+            die "refusing to use a shared or system directory as the installation prefix: $prefix_real"
+            ;;
+    esac
+    for entry in "$prefix_real"/* "$prefix_real"/.[!.]* "$prefix_real"/..?*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        entry_name="${entry##*/}"
+        case "$entry_name" in
+            bin|config|data|logs|backups) ;;
+            *) die "refusing to use a prefix containing an unmanaged top-level entry: $entry" ;;
+        esac
+    done
 }
 
 BIN="$PREFIX/bin/agentrecall"
@@ -271,6 +318,46 @@ effective_supervisor() {
     detect_supervisor
 }
 
+load_deployment_options() {
+    [ -s "$SUPERVISOR_STATE_FILE" ] || return 0
+    saved_label_prefix="$LABEL_PREFIX"
+    saved_router="$WITH_ROUTER"
+    saved_bind="$BIND_ADDR"
+    saved_router_bind="$ROUTER_BIND_ADDR"
+    saved_namespaces="$NAMESPACES"
+    line_number=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line_number=$((line_number + 1))
+        [ "$line_number" -eq 1 ] && continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "$key" in
+            label_prefix) saved_label_prefix="$value" ;;
+            router) saved_router="$value" ;;
+            bind_addr) saved_bind="$value" ;;
+            router_bind_addr) saved_router_bind="$value" ;;
+            namespaces) saved_namespaces="$value" ;;
+        esac
+    done < "$SUPERVISOR_STATE_FILE"
+    [ -n "$LABEL_PREFIX_OVERRIDE" ] || LABEL_PREFIX="$saved_label_prefix"
+    [ -n "$WITH_ROUTER_OVERRIDE" ] || WITH_ROUTER="$saved_router"
+    [ -n "$BIND_ADDR_OVERRIDE" ] || BIND_ADDR="$saved_bind"
+    [ -n "$ROUTER_BIND_ADDR_OVERRIDE" ] || ROUTER_BIND_ADDR="$saved_router_bind"
+    [ -n "$NAMESPACES_OVERRIDE" ] || NAMESPACES="$saved_namespaces"
+}
+
+write_deployment_state() {
+    {
+        printf '%s\n' "$(detect_supervisor)"
+        printf 'label_prefix=%s\n' "$LABEL_PREFIX"
+        printf 'router=%s\n' "$WITH_ROUTER"
+        printf 'bind_addr=%s\n' "$BIND_ADDR"
+        printf 'router_bind_addr=%s\n' "$ROUTER_BIND_ADDR"
+        printf 'namespaces=%s\n' "$NAMESPACES"
+    } > "$SUPERVISOR_STATE_FILE"
+    chmod 600 "$SUPERVISOR_STATE_FILE"
+}
+
 SERVICE_LABEL="$LABEL_PREFIX.service"
 ROUTER_LABEL="$LABEL_PREFIX.router"
 SERVICE_UNIT="$LABEL_PREFIX.service"
@@ -362,9 +449,9 @@ launchd_load() {
 supervisor_start() {
     case "$1" in
         launchd)
-            launchd_load "$SERVICE_LABEL"
+            launchd_load "$SERVICE_LABEL" || return 1
             if [ "$WITH_ROUTER" = "yes" ]; then
-                launchd_load "$ROUTER_LABEL"
+                launchd_load "$ROUTER_LABEL" || return 1
             fi
             ;;
         systemd)
@@ -373,11 +460,11 @@ supervisor_start() {
                 warn "start them later with: systemctl --user enable --now $SERVICE_UNIT"
                 return 1
             fi
-            systemctl --user daemon-reload
-            systemctl --user enable --now "$SERVICE_UNIT"
+            systemctl --user daemon-reload || return 1
+            systemctl --user enable --now "$SERVICE_UNIT" || return 1
             step "enabled $SERVICE_UNIT"
             if [ "$WITH_ROUTER" = "yes" ]; then
-                systemctl --user enable --now "$ROUTER_UNIT"
+                systemctl --user enable --now "$ROUTER_UNIT" || return 1
                 step "enabled $ROUTER_UNIT"
             fi
             ;;
@@ -385,6 +472,19 @@ supervisor_start() {
             die "supervisor 'none' cannot start a background service; run the binary directly"
             ;;
     esac
+}
+
+INSTALL_CLEANUP_PENDING="no"
+INSTALL_CLEANUP_SUPERVISOR=""
+
+install_failure_cleanup() {
+    install_status=$?
+    trap - EXIT INT TERM
+    if [ "$INSTALL_CLEANUP_PENDING" = "yes" ]; then
+        warn "installation did not complete; stopping the partially started services"
+        supervisor_stop "$INSTALL_CLEANUP_SUPERVISOR" >/dev/null 2>&1 || true
+    fi
+    exit "$install_status"
 }
 
 supervisor_stop() {
@@ -412,6 +512,103 @@ supervisor_stop() {
     esac
 }
 
+BACKUP_RESTORE_PENDING="no"
+BACKUP_SUPERVISOR=""
+BACKUP_SERVICE_WAS_ACTIVE="no"
+BACKUP_ROUTER_WAS_ACTIVE="no"
+BACKUP_OUTPUT_FILE=""
+BACKUP_VERIFY_FILE=""
+
+supervisor_component_active() {
+    supervisor="$1"
+    component="$2"
+    case "$supervisor:$component" in
+        systemd:service) unit="$SERVICE_UNIT" ;;
+        systemd:router) unit="$ROUTER_UNIT" ;;
+        launchd:service) unit="$SERVICE_LABEL" ;;
+        launchd:router) unit="$ROUTER_LABEL" ;;
+        *) return 2 ;;
+    esac
+    if [ "$supervisor" = "systemd" ]; then
+        if systemctl --user is-active --quiet "$unit"; then
+            return 0
+        else
+            status=$?
+            case "$status" in
+                3|4) return 1 ;;
+                *) return 2 ;;
+            esac
+        fi
+    fi
+    if launchctl print "gui/$(id -u)/$unit" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+supervisor_stop_for_backup() {
+    case "$BACKUP_SUPERVISOR" in
+        systemd)
+            if [ "$BACKUP_SERVICE_WAS_ACTIVE" = "yes" ]; then
+                systemctl --user stop "$SERVICE_UNIT" || return 1
+            fi
+            if [ "$BACKUP_ROUTER_WAS_ACTIVE" = "yes" ]; then
+                systemctl --user stop "$ROUTER_UNIT" || return 1
+            fi
+            ;;
+        launchd)
+            if [ "$BACKUP_SERVICE_WAS_ACTIVE" = "yes" ]; then
+                launchctl bootout "gui/$(id -u)/$SERVICE_LABEL" >/dev/null 2>&1 || return 1
+            fi
+            if [ "$BACKUP_ROUTER_WAS_ACTIVE" = "yes" ]; then
+                launchctl bootout "gui/$(id -u)/$ROUTER_LABEL" >/dev/null 2>&1 || return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    if supervisor_component_active "$BACKUP_SUPERVISOR" service; then return 1; else [ "$?" -eq 1 ] || return 1; fi
+    if supervisor_component_active "$BACKUP_SUPERVISOR" router; then return 1; else [ "$?" -eq 1 ] || return 1; fi
+}
+
+supervisor_restore_after_backup() {
+    case "$BACKUP_SUPERVISOR" in
+        systemd)
+            if [ "$BACKUP_SERVICE_WAS_ACTIVE" = "yes" ]; then
+                systemctl --user start "$SERVICE_UNIT" || return 1
+            fi
+            if [ "$BACKUP_ROUTER_WAS_ACTIVE" = "yes" ]; then
+                systemctl --user start "$ROUTER_UNIT" || return 1
+            fi
+            ;;
+        launchd)
+            if [ "$BACKUP_SERVICE_WAS_ACTIVE" = "yes" ]; then
+                launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_DIR/$SERVICE_LABEL.plist" || return 1
+            fi
+            if [ "$BACKUP_ROUTER_WAS_ACTIVE" = "yes" ]; then
+                launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_DIR/$ROUTER_LABEL.plist" || return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+backup_exit_cleanup() {
+    backup_status=$?
+    trap - EXIT INT TERM
+    [ -z "$BACKUP_VERIFY_FILE" ] || rm -f "$BACKUP_VERIFY_FILE" || true
+    if [ "$backup_status" -ne 0 ] && [ -n "$BACKUP_OUTPUT_FILE" ]; then
+        rm -f "$BACKUP_OUTPUT_FILE" || true
+    fi
+    if [ "$BACKUP_RESTORE_PENDING" = "yes" ]; then
+        BACKUP_RESTORE_PENDING="no"
+        if ! supervisor_restore_after_backup; then
+            warn "could not restore the service state after backup"
+            [ "$backup_status" -ne 0 ] || backup_status=1
+        fi
+    fi
+    exit "$backup_status"
+}
+
 supervisor_status() {
     case "$1" in
         launchd)
@@ -432,7 +629,10 @@ cmd_install() {
     need curl
     log "installing a single-node AgentRecall deployment into $PREFIX"
 
-    mkdir -p "$PREFIX" "$BIN_DIR" "$CONFIG_DIR" "$DATA_DIR/models" "$LOG_DIR" "$BACKUP_DIR"
+    [ -n "$PREFIX" ] || die "installation prefix must not be empty"
+    mkdir -p "$PREFIX"
+    validate_prefix_directory
+    mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$DATA_DIR/models" "$LOG_DIR" "$BACKUP_DIR"
     chmod 700 "$PREFIX" "$CONFIG_DIR" "$DATA_DIR" "$BACKUP_DIR"
 
     if [ -z "$BINARY" ] && [ "$SKIP_BUILD" = "no" ]; then
@@ -485,8 +685,7 @@ cmd_install() {
     # Record the supervisor this deployment uses, so that a later status or
     # uninstall reports and stops this deployment and not whatever happens to
     # be detected on the host right now.
-    printf '%s\n' "$(detect_supervisor)" > "$SUPERVISOR_STATE_FILE"
-    chmod 600 "$SUPERVISOR_STATE_FILE"
+    write_deployment_state
 
     started="yes"
     case "$(detect_supervisor)" in
@@ -496,7 +695,14 @@ cmd_install() {
             if [ "$WITH_ROUTER" = "yes" ]; then
                 write_launchd_plist "$ROUTER_LABEL" serve-router router
             fi
-            supervisor_start launchd || started="no"
+            INSTALL_CLEANUP_SUPERVISOR="launchd"
+            INSTALL_CLEANUP_PENDING="yes"
+            trap 'install_failure_cleanup' EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            if ! supervisor_start launchd; then
+                die "could not start the launchd deployment"
+            fi
             ;;
         systemd)
             log "installing the systemd user units"
@@ -504,7 +710,14 @@ cmd_install() {
             if [ "$WITH_ROUTER" = "yes" ]; then
                 write_systemd_unit "$ROUTER_UNIT" serve-router
             fi
-            supervisor_start systemd || started="no"
+            INSTALL_CLEANUP_SUPERVISOR="systemd"
+            INSTALL_CLEANUP_PENDING="yes"
+            trap 'install_failure_cleanup' EXIT
+            trap 'exit 130' INT
+            trap 'exit 143' TERM
+            if ! supervisor_start systemd; then
+                die "could not start the systemd deployment"
+            fi
             ;;
         none)
             started="no"
@@ -523,14 +736,17 @@ cmd_install() {
     if wait_for_ready; then
         log "service is ready"
     else
-        warn "the service did not become ready; check $LOG_DIR"
-        exit 1
+        die "the service did not become ready; stopped the deployment; check $LOG_DIR"
     fi
 
     if [ "$WITH_ROUTER" = "yes" ]; then
-        wait_for_router
+        if ! wait_for_router; then
+            die "the router did not become ready; stopped the deployment; check $LOG_DIR"
+        fi
     fi
 
+    INSTALL_CLEANUP_PENDING="no"
+    trap - EXIT INT TERM
     cmd_env
 }
 
@@ -604,20 +820,47 @@ cmd_status() {
 
 cmd_backup() {
     require_installed
-    log "stopping the service so DuckDB can be copied safely"
-    supervisor_stop "$(effective_supervisor)"
-    sleep 3
+    BACKUP_SUPERVISOR="$(effective_supervisor)"
+    case "$BACKUP_SUPERVISOR" in
+        systemd) need systemctl ;;
+        launchd) need launchctl ;;
+        none) die "backup requires a managed launchd/systemd service; stop an unmanaged service and run the binary's backup command directly" ;;
+        *) die "unsupported supervisor for backup: $BACKUP_SUPERVISOR" ;;
+    esac
+
+    if supervisor_component_active "$BACKUP_SUPERVISOR" service; then
+        BACKUP_SERVICE_WAS_ACTIVE="yes"
+    else
+        active_status=$?
+        [ "$active_status" -eq 1 ] || die "could not determine whether the service is active"
+    fi
+    if supervisor_component_active "$BACKUP_SUPERVISOR" router; then
+        BACKUP_ROUTER_WAS_ACTIVE="yes"
+    else
+        active_status=$?
+        [ "$active_status" -eq 1 ] || die "could not determine whether the router is active"
+    fi
+
+    BACKUP_RESTORE_PENDING="yes"
+    trap 'backup_exit_cleanup' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    log "stopping the managed service so DuckDB can be copied safely"
+    if ! supervisor_stop_for_backup; then
+        die "could not stop the deployment for backup"
+    fi
+    if [ "$BACKUP_SERVICE_WAS_ACTIVE" = "yes" ] || [ "$BACKUP_ROUTER_WAS_ACTIVE" = "yes" ]; then
+        sleep 3
+    fi
     stamp="$(date +%Y%m%d-%H%M%S)"
-    out="$BACKUP_DIR/agentrecall-$stamp.duckdb"
-    "$BIN" backup --database "$DATA_DIR/agentrecall.duckdb" --output "$out" \
+    BACKUP_OUTPUT_FILE="$BACKUP_DIR/agentrecall-$stamp.duckdb"
+    BACKUP_VERIFY_FILE="$BACKUP_DIR/.verify-$stamp.duckdb"
+    "$BIN" backup --database "$DATA_DIR/agentrecall.duckdb" --output "$BACKUP_OUTPUT_FILE" \
         || die "backup failed"
     log "verifying the backup"
-    "$BIN" restore --backup "$out" --verify --database "$BACKUP_DIR/.verify-$stamp.duckdb" \
+    "$BIN" restore --backup "$BACKUP_OUTPUT_FILE" --verify --database "$BACKUP_VERIFY_FILE" \
         || die "the backup did not verify"
-    rm -f "$BACKUP_DIR/.verify-$stamp.duckdb"
-    step "verified $out"
-    log "restarting the service"
-    supervisor_start "$(effective_supervisor)"
+    step "verified $BACKUP_OUTPUT_FILE"
 }
 
 cmd_env() {
@@ -642,6 +885,9 @@ cmd_env() {
 
 cmd_uninstall() {
     require_installed
+    if [ "$PURGE" = "yes" ]; then
+        validate_prefix_directory
+    fi
     log "stopping the deployment"
     # Stop the recorded supervisor and the detected one: a deployment may have
     # been installed with one supervisor and later reinstalled with another.
@@ -673,8 +919,11 @@ cmd_uninstall() {
 # -------------------------------------------------------------------- main --
 
 WITH_ROUTER="yes"
-BIND_PORT="${BIND_ADDR##*:}"
-ROUTER_PORT="${ROUTER_BIND_ADDR##*:}"
+BIND_ADDR_OVERRIDE=""
+ROUTER_BIND_ADDR_OVERRIDE=""
+WITH_ROUTER_OVERRIDE=""
+LABEL_PREFIX_OVERRIDE=""
+NAMESPACES_OVERRIDE=""
 BIN_DIR="$PREFIX/bin"
 PURGE="no"
 
@@ -688,16 +937,16 @@ fi
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --prefix) PREFIX="$2"; shift 2 ;;
-        --bind) BIND_ADDR="$2"; BIND_PORT="${BIND_ADDR##*:}"; shift 2 ;;
-        --router-bind) ROUTER_BIND_ADDR="$2"; ROUTER_PORT="${ROUTER_BIND_ADDR##*:}"; shift 2 ;;
+        --bind) BIND_ADDR="$2"; BIND_ADDR_OVERRIDE="$2"; shift 2 ;;
+        --router-bind) ROUTER_BIND_ADDR="$2"; ROUTER_BIND_ADDR_OVERRIDE="$2"; shift 2 ;;
         --owner) OWNER_ID="$2"; shift 2 ;;
         --client) CLIENT_ID="$2"; shift 2 ;;
         --scopes) SCOPES="$2"; shift 2 ;;
-        --namespaces) NAMESPACES="$2"; shift 2 ;;
+        --namespaces) NAMESPACES="$2"; NAMESPACES_OVERRIDE="$2"; shift 2 ;;
         --quota) QUOTA_PER_OWNER="$2"; shift 2 ;;
-        --label-prefix) LABEL_PREFIX="$2"; shift 2 ;;
+        --label-prefix) LABEL_PREFIX="$2"; LABEL_PREFIX_OVERRIDE="$2"; shift 2 ;;
         --supervisor) SUPERVISOR="$2"; shift 2 ;;
-        --no-router) WITH_ROUTER="no"; shift ;;
+        --no-router) WITH_ROUTER="no"; WITH_ROUTER_OVERRIDE="no"; shift ;;
         --no-embeddings) USE_EMBEDDINGS="no"; shift ;;
         --no-extensions) PROVISION_EXTENSIONS="no"; shift ;;
         --binary) BINARY="$2"; shift 2 ;;
@@ -721,6 +970,18 @@ CURSOR_SECRET_FILE="$CONFIG_DIR/cursor_hmac.secret"
 ROUTER_SECRET_FILE="$CONFIG_DIR/router_ingress.secret"
 SERVICE_SECRET_FILE="$CONFIG_DIR/local_service.secret"
 SUPERVISOR_STATE_FILE="$CONFIG_DIR/supervisor"
+if [ "$COMMAND" != "install" ]; then
+    load_deployment_options
+fi
+validate_loopback_bind "service" "$BIND_ADDR"
+validate_loopback_bind "router" "$ROUTER_BIND_ADDR"
+case "$WITH_ROUTER" in yes|no) ;; *) die "invalid saved router setting: $WITH_ROUTER" ;; esac
+case "$LABEL_PREFIX" in
+    ''|*[!A-Za-z0-9._-]*) die "label prefix may contain only letters, numbers, dot, underscore, and hyphen" ;;
+esac
+case "$SUPERVISOR" in auto|launchd|systemd|none) ;; *) die "unsupported supervisor: $SUPERVISOR" ;; esac
+BIND_PORT="${BIND_ADDR##*:}"
+ROUTER_PORT="${ROUTER_BIND_ADDR##*:}"
 SERVICE_LABEL="$LABEL_PREFIX.service"
 ROUTER_LABEL="$LABEL_PREFIX.router"
 SERVICE_UNIT="$LABEL_PREFIX.service"

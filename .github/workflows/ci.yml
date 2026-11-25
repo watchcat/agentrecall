@@ -65,3 +65,6 @@ jobs:
 
       - name: Run ShellCheck
         run: shellcheck scripts/local-deploy.sh
+
+      - name: Run deployment lifecycle tests
+        run: bash tests/local-deploy.sh

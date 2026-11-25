@@ -92,7 +92,7 @@ AgentRecall runs as a single-node service that owns one DuckDB file. Two deploym
 
 ### Variant 1: single-node deployment on one machine
 
-`scripts/local-deploy.sh` installs, inspects, backs up, and removes a loopback-only deployment: one MCP service on `127.0.0.1:8789` plus the optional Hermes router on `127.0.0.1:8788`. Everything it writes stays under one prefix directory, secrets are generated locally with `0600` permissions, and no raw token is ever printed.
+`scripts/local-deploy.sh` installs, inspects, backs up, and removes a loopback-only deployment: one MCP service on `127.0.0.1:8789` plus the optional Hermes router on `127.0.0.1:8788`. Application files and secret files stay under one prefix; launchd plists and systemd user units are written to their standard per-user service directories. Secrets are generated locally with `0600` permissions, and no raw token is ever printed.
 
 ```sh
 git clone https://github.com/watchcat/agentrecall.git
@@ -123,7 +123,7 @@ The install step is idempotent. Running it again reuses the active client token,
 
 Useful options: `--prefix` moves the installation root, `--bind` and `--router-bind` change the loopback ports, `--client` and `--owner` set the identity of the created token, `--scopes` and `--namespaces` set its permissions, `--supervisor` selects `launchd`, `systemd`, or `none`, `--no-router` installs the service only, `--no-embeddings` keeps search lexical, `--no-extensions` skips extension provisioning, and `--binary` uses an already built binary instead of compiling.
 
-A backup needs the service stopped, because DuckDB allows a single writer per file. The script stops the service, writes the backup, and starts it again.
+A backup needs the service stopped, because DuckDB allows a single writer per file. With launchd or systemd, the script stops only the services that were active, verifies the backup, then restores their prior state even if backup or verification fails. With `--supervisor none`, the script refuses to run a managed backup because it cannot stop or restore a manually launched service; stop it yourself and run the binary's `backup` command directly.
 
 ### Variant 2: explicit deployment
 

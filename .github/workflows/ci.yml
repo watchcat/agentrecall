@@ -52,3 +52,16 @@ jobs:
       # Chrono is currently unmaintained and has no safe RustSec upgrade.
       - name: Audit dependencies for advisories
         run: cargo audit --ignore RUSTSEC-2026-0543
+
+  shell:
+    name: Deployment script checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Check the shell syntax
+        run: bash -n scripts/local-deploy.sh
+
+      - name: Run ShellCheck
+        run: shellcheck scripts/local-deploy.sh

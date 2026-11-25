@@ -1,6 +1,6 @@
 # Implementation status and release gates
 
-The current source has passed Rust 1.100.0 build/test checks and a real local BGE-M3 inference smoke; it has not been deployed to production. The current automated suite covers verified backup/restore, snapshot-based peer seeding, atomic stale-watermark rejection, and a two-database restart/partition recovery scenario. VSS/HNSW-backed retrieval and the remaining production release gates below are still unverified.
+The current source has passed Rust 1.100.0 build/test checks and a real local BGE-M3 inference smoke; it has not been deployed to production. The current automated suite covers verified backup/restore, snapshot-based peer seeding, atomic stale-watermark rejection, and a two-database restart/partition recovery scenario. A scripted single-node deployment was validated separately and is described below; the remaining production release gates are still unverified.
 
 ## Verified before BGE-M3 integration
 
@@ -32,6 +32,27 @@ The project includes an opt-in local FastEmbed BGE-M3 (`BGEM3Q`) provider with 1
 
 VSS was not installed for that service run. Semantic retrieval therefore used exact owner/namespace-scoped vector scoring; the provider smoke did not exercise VSS or HNSW. The `.fastembed_cache/` directory is ignored by Git, and the local model cache was not published.
 
+## Scripted single-node deployment
+
+`scripts/local-deploy.sh` adds a repeatable single-node deployment for one machine: one MCP service on loopback plus the optional Hermes router, with secrets generated locally and stored `0600`. The script never prints a raw token; it captures the one-time `create-token` output into a `0600` file and prints the path to that file instead.
+
+The following was executed end to end on macOS against a disposable prefix, using the release binary built from this source tree:
+
+- `install` created the service and router, generated the cursor, service, and router secrets, created the client token, provisioned the DuckDB FTS and VSS extensions, wrote the launchd units, started both jobs, and waited for readiness. The reported Hermes endpoint was `http://127.0.0.1:8788/mcp`, with the token read from `config/router_ingress.secret`.
+- A second `install` with the same client id reused the active token instead of creating a second credential, re-provisioned the extensions against the live database, and restarted the service.
+- `status`, `env`, and `backup` completed, and the produced backup was verified with `restore --verify` against the canonical tables.
+- `uninstall` stopped the jobs and removed the launchd plists and the systemd unit files, keeping the database and the secrets; `--purge` removes the prefix as well.
+- The systemd supervisor path writes user unit files and, on a host without `systemctl`, reports that the units were written but not started. It was therefore not exercised as a running service.
+
+In the resulting live single-node service, `/health/ready` reported `status: ready`, `search_mode: hybrid`, `search_engine: duckdb_vss_hnsw`, `hnsw_active: true`, and `replication_configured: false`. With the BGE-M3 provider and the VSS extension both active, a query in one language retrieved a record written in another with a scored relevance value.
+
+Two implementation notes came out of that run and are now enforced by the script:
+
+- The binary is installed through a temporary file and a rename. Overwriting a running Mach-O executable in place invalidates its code signature, and macOS AMFI then kills the next launch of that file with `SIGKILL`.
+- The DuckDB extensions are provisioned while the service is stopped, because DuckDB serialises extension installation against a live database handle.
+
+This evidence covers one node with no replication peer. It does not verify the two-node topology, a published cloud endpoint, or Cue interoperability.
+
 ## Backup, retention, and replication recovery coverage
 
 The current 57-test suite includes automated coverage on disposable databases for:
@@ -45,8 +66,8 @@ The fixed retention limits are 90 days or 100,000 mutation events per origin, wh
 
 ## Remaining release gates
 
-- Extend BGE-M3 service validation beyond the successful save/search smoke: exercise update/delete and restart behavior, and measure model quality, throughput, and memory on the intended hardware.
-- Install VSS and verify BGE-M3 semantic search using owner/namespace-scoped HNSW, including index creation and rebuild; the real-provider smoke above used exact-vector fallback and did not exercise HNSW.
+- Extend BGE-M3 service validation beyond the successful save/search smoke: exercise update/delete and restart behavior with the real provider, and measure model quality, throughput, and memory on the intended hardware. The scripted single-node deployment restarted the service, but provider-backed retrieval after that restart was not re-measured.
+- Complete the real-provider VSS path: the single-node deployment reported an active HNSW index and scored cross-lingual retrieval, but the index rebuild after a service restart with BGE-M3 was not exercised, and cross-replica semantic retrieval with matched model versions is still unverified.
 - Confirm embedding model/version/dimension compatibility on both replicas before relying on cross-replica semantic retrieval.
 - Validate live Cue and Hermes endpoints, active recall/capture behavior, and cross-client retrieval after deployment.
 - Run broader live cross-replica restart/disconnection and network-partition acceptance beyond the automated two-database scenario; also test conflicts, read-only/revoked credentials, namespace isolation, oversized/malformed requests, rate limits, client disconnects, token rotation, and redaction.

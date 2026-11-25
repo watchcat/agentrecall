@@ -5,7 +5,7 @@
 
 AgentRecall is a self-hostable shared-memory service for AI agents and applications. It is written in Rust and exposes memory operations over MCP Streamable HTTP, with an embedded DuckDB database owned by each service instance. Clients use the service API; they never open database files directly.
 
-> **Status: prototype.** On Rust 1.100.0, `cargo fmt --check`, `cargo check --all-targets`, the 57-test `cargo test --all-targets` suite, strict Clippy, and CLI help passed locally; the release build passed in the prior validation. A real local BGE-M3 smoke test initialized the model, saved a Cantonese memory, and retrieved it with an English query. That service run had no VSS extension, so it used exact owner/namespace-scoped vector scoring; it did not exercise HNSW. Automated tests cover verified backup/restore, fresh-identity snapshot seeding, atomic stale-watermark rejection, and two-database recovery after a restart and partition. Full live two-node acceptance, Cue/Hermes integration, and production deployment/security checks remain. See [implementation status and release gates](docs/implementation-status.md).
+> **Status: prototype.** On Rust 1.100.0, `cargo fmt --check`, `cargo check --all-targets`, the 57-test `cargo test --all-targets` suite, strict Clippy, and CLI help passed locally; the release build passed in the prior validation. A real local BGE-M3 smoke test initialized the model, saved a Cantonese memory, and retrieved it with an English query. That service run had no VSS extension, so it used exact owner/namespace-scoped vector scoring; it did not exercise HNSW. A scripted single-node deployment (`scripts/local-deploy.sh`) was validated end to end on macOS with launchd, including an idempotent reinstall, a verified backup, and a clean uninstall; in that deployment the VSS extension was provisioned and `/health/ready` reported `hnsw_active: true` with `search_engine: duckdb_vss_hnsw`, and cross-lingual retrieval returned scored hits. Automated tests cover verified backup/restore, fresh-identity snapshot seeding, atomic stale-watermark rejection, and two-database recovery after a restart and partition. Full live two-node acceptance, Cue integration, and production deployment/security checks remain. See [implementation status and release gates](docs/implementation-status.md).
 
 ## What it provides
 
@@ -15,6 +15,7 @@ AgentRecall is a self-hostable shared-memory service for AI agents and applicati
 - Optional local-initiated replication between independent database instances, with idempotent event application, atomic stale-watermark rejection, snapshot seeding for a fresh peer identity, and explicit retention/resolution of concurrent branches.
 - Lexical search remains available without optional extensions; DuckDB FTS/BM25 and semantic search are implemented. The local BGE-M3 provider smoke passed, using exact scoped-vector fallback because VSS was not installed.
 - An optional loopback-only router for Hermes that prefers the local service and uses the cloud route only under narrowly defined connection-failure conditions.
+- A scripted single-node deployment (`scripts/local-deploy.sh`) that installs, inspects, backs up, and removes a loopback-only service plus router, with locally generated `0600` secrets that are never printed.
 
 ## Architecture
 
@@ -85,6 +86,66 @@ The service listens on `127.0.0.1:8789` by default and fails closed if its token
 
 For Hermes local-first routing, run `cargo run --release -- serve-router` on the Hermes machine and configure Hermes with only the loopback router endpoint and ingress credential. The router keeps separate local-service and optional cloud-fallback credentials; leave both cloud variables unset for local-only operation. Follow the complete [deployment guide](docs/deployment.md); registering a server alone does not install memory-use behavior in either client.
 
+## Deployment
+
+AgentRecall runs as a single-node service that owns one DuckDB file. Two deployment variants are supported: a scripted single-node deployment for one machine, and an explicit deployment for the two-node local+cloud topology.
+
+### Variant 1: single-node deployment on one machine
+
+`scripts/local-deploy.sh` installs, inspects, backs up, and removes a loopback-only deployment: one MCP service on `127.0.0.1:8789` plus the optional Hermes router on `127.0.0.1:8788`. Everything it writes stays under one prefix directory, secrets are generated locally with `0600` permissions, and no raw token is ever printed.
+
+```sh
+git clone https://github.com/watchcat/agentrecall.git
+cd agentrecall
+./scripts/local-deploy.sh install
+```
+
+The install step builds the release binary, generates the cursor, service, and router secrets, creates the client token, provisions the DuckDB FTS and VSS extensions, writes the supervisor units (launchd on macOS, systemd user units on Linux), starts the service, and prints the Hermes wiring:
+
+```
+==> Hermes wiring
+  AGENTRECALL_MCP_URL=http://127.0.0.1:8788/mcp
+  AGENTRECALL_MCP_TOKEN=<the contents of ~/.local/share/agentrecall/config/router_ingress.secret>
+  AGENTRECALL_NAMESPACE=shared
+```
+
+Read the token from the file rather than from the output; the script never prints it.
+
+| Command | Effect |
+| --- | --- |
+| `scripts/local-deploy.sh status` | Reports the supervisor state, the service health, and the file layout |
+| `scripts/local-deploy.sh env` | Prints the Hermes wiring block again |
+| `scripts/local-deploy.sh backup` | Writes a verified checkpointed backup into the prefix |
+| `scripts/local-deploy.sh uninstall` | Stops the services and removes the supervisor units; the database and secrets stay |
+| `scripts/local-deploy.sh uninstall --purge` | Also deletes the prefix directory, including the database and all secrets |
+
+The install step is idempotent. Running it again reuses the active client token, re-provisions the extensions, and restarts the service instead of creating a second credential.
+
+Useful options: `--prefix` moves the installation root, `--bind` and `--router-bind` change the loopback ports, `--client` and `--owner` set the identity of the created token, `--scopes` and `--namespaces` set its permissions, `--supervisor` selects `launchd`, `systemd`, or `none`, `--no-router` installs the service only, `--no-embeddings` keeps search lexical, `--no-extensions` skips extension provisioning, and `--binary` uses an already built binary instead of compiling.
+
+A backup needs the service stopped, because DuckDB allows a single writer per file. The script stops the service, writes the backup, and starts it again.
+
+### Variant 2: explicit deployment
+
+Use this variant for the two-node local+cloud topology, for a shared host, or when the supervisor and TLS termination are managed outside AgentRecall.
+
+1. Build the binary on each node and create a separate credential per client.
+2. Run the service on the local node, bound to loopback, and run the router on the same machine.
+3. Terminate TLS in a trusted reverse proxy and publish only the cloud MCP endpoint; see [examples/deployment/Caddyfile](examples/deployment/Caddyfile).
+4. Configure the cloud node, the replication credentials, and the peer variables on the local node.
+
+Follow the complete [deployment guide](docs/deployment.md) for the exact environment variables, unit files, and reverse-proxy settings.
+
+| | Variant 1 | Variant 2 |
+| --- | --- | --- |
+| Topology | One node, loopback only | Local node plus a cloud node behind a reverse proxy |
+| Supervisor | launchd or systemd user units, written by the script | Managed by the operator |
+| TLS | Not applicable, loopback only | Required for the published cloud endpoint |
+| Replication | None | Optional, local-initiated |
+| Best for | Hermes on one machine | Shared or remote clients, Cue |
+
+Registering a server alone does not install memory-use behavior in either client.
+
 ## Search and replication details
 
 Canonical lexical search is always available. Operators may explicitly provision DuckDB FTS/BM25 and VSS for the pinned build:
@@ -94,7 +155,7 @@ cargo run --release -- install-fts
 cargo run --release -- install-vss
 ```
 
-FTS accelerates lexical retrieval. The semantic search path is covered by a deterministic test adapter, and actual local BGE-M3 inference was smoke-tested through an isolated service: it saved a Cantonese memory and retrieved it with an English query. VSS was not installed for that run, so retrieval used exact owner/namespace-scoped vector scoring and did not exercise HNSW. With VSS provisioned, AgentRecall can persist model/version-tagged derived vectors and build per-owner/per-namespace HNSW indexes in memory. Without an embedding adapter, search remains lexical. Expired and deleted records are removed from derived search projections as part of retrieval and mutation handling.
+FTS accelerates lexical retrieval. The semantic search path is covered by a deterministic test adapter, and actual local BGE-M3 inference was smoke-tested through an isolated service: it saved a Cantonese memory and retrieved it with an English query. VSS was not installed for that run, so retrieval used exact owner/namespace-scoped vector scoring and did not exercise HNSW. A later single-node deployment installed through `scripts/local-deploy.sh` did provision VSS and reported `hnsw_active: true` with `search_engine: duckdb_vss_hnsw`, and cross-lingual queries returned scored hits; that evidence covers one node, not a replicated pair. With VSS provisioned, AgentRecall can persist model/version-tagged derived vectors and build per-owner/per-namespace HNSW indexes in memory. Without an embedding adapter, search remains lexical. Expired and deleted records are removed from derived search projections as part of retrieval and mutation handling.
 
 The local replica initiates HTTPS exchanges with the cloud endpoint when `AGENTRECALL_PEER_URL`, `AGENTRECALL_PEER_TOKEN`, and `AGENTRECALL_PEER_REPLICA_ID` are configured. Replication is optional; without a peer, the service can run standalone. Replication credentials are separate from MCP client credentials. Delivery is at-least-once and event application is idempotent. The hourly collector emits tombstones for expired records and prunes mutation history at the first fixed limit reached: 90 days of age or 100,000 events per origin. Neither limit is runtime-configurable, and compaction does not wait for peer acknowledgements. It retains each record's current version envelope with canonical state. Exchanges below a required pruning watermark are rejected atomically before inbound events are applied or either cursor advances. A stale peer cannot recover pruned history by restarting; provision a new peer from a verified snapshot with `seed-peer` and a fresh replica ID. This does not merge writes that exist only on the old stale database, so preserve and reconcile those before replacing it. Conflicts require an operator to inspect retained branches and explicitly resolve them.
 

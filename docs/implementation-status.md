@@ -18,7 +18,7 @@ Before the BGE-M3 provider and Rust 1.100 migration, the core checks passed: `ca
 
 ## Current BGE-M3 and Rust status
 
-The reported final acceptance run on Rust 1.100.0 passed 57 tests with `cargo test --all-targets`. The current source also passed `cargo fmt --check`, `cargo check --all-targets`, strict all-target/all-feature Clippy, and CLI `--help`. The release build passed in an earlier validation. Dependency audit results below refer to an earlier audited checkpoint and were not re-run against this current source state.
+The reported final acceptance run on Rust 1.100.0 passed 57 tests with `cargo test --all-targets`; the reported `cargo check --all-targets` also passed with debug information disabled to fit the available disk. A later Mac rerun stopped before tests began because the disk filled, so it did not freshly rerun or supersede the reported 57-test result. The current source also passed `cargo fmt --check`, strict all-target/all-feature Clippy, and CLI `--help`. The release build passed in an earlier validation. Dependency audit results below refer to an earlier audited checkpoint and were not re-run against this current source state.
 
 ### Dependency advisory notes from the earlier audit
 

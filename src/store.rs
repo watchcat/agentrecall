@@ -3483,6 +3483,19 @@ mod tests {
         );
         assert_eq!(store.search_engine(), "exact_scoped_vector_scan");
 
+        // Keep the projection-mismatch probe independent from the expired-row purge above.
+        {
+            let connection = store
+                .lock()
+                .expect("lock expired fixture before projection-mismatch check");
+            connection
+                .execute(
+                    "UPDATE memories SET deleted_at=CAST(CURRENT_TIMESTAMP AS VARCHAR) WHERE owner_id=? AND memory_id=?",
+                    params![owner.owner_id, expired.id],
+                )
+                .expect("exclude expired fixture from later purge");
+        }
+
         store.vss_available.store(true, Ordering::Relaxed);
         {
             let vector_connection = store

@@ -106,6 +106,9 @@ cat > "$MOCK_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 request="$*"
+if [ -n "${FAKE_CURL_LOG:-}" ]; then
+    printf '%s\n' "$request" >> "$FAKE_CURL_LOG"
+fi
 case "${FAKE_CURL_MODE:-ready}" in
     service-fails) exit 22 ;;
     router-fails)
@@ -181,13 +184,93 @@ env HOME="$state_home" PATH="$MOCK_BIN:$PATH" FAKE_ACTIVE_UNITS="$TEST_ROOT/stat
     "$DEPLOY_SCRIPT" install --prefix "$state_prefix" --binary "$FAKE_BINARY" --no-extensions \
     --no-embeddings --no-router --supervisor none --bind 127.0.0.1:8890 --namespaces shared,dev \
     > "$TEST_ROOT/state-install.log" 2>&1
+{
+    printf 'none\n'
+    printf 'label_prefix=com.agentrecall\n'
+    printf 'router=yes\n'
+    printf 'bind_addr=127.0.0.1:8789\n'
+    printf 'router_bind_addr=127.0.0.1:8788\n'
+    printf 'namespaces=shared,dev\n'
+} > "$state_prefix/config/supervisor"
+printf 'stale router secret fixture\n' > "$state_prefix/config/router_ingress.secret"
 env HOME="$state_home" PATH="$MOCK_BIN:$PATH" FAKE_ACTIVE_UNITS="$TEST_ROOT/state.active" \
     "$DEPLOY_SCRIPT" env --prefix "$state_prefix" > "$TEST_ROOT/state-env.log" 2>&1
 grep -Fq 'AGENTRECALL_MCP_URL=http://127.0.0.1:8890/mcp' "$TEST_ROOT/state-env.log" \
     || fail "env did not reuse the saved service bind"
 grep -Fq 'AGENTRECALL_NAMESPACE=shared,dev' "$TEST_ROOT/state-env.log" \
     || fail "env did not reuse the saved namespace"
-pass "later commands reuse persisted bind and router settings"
+if grep -Fq 'router_ingress.secret' "$TEST_ROOT/state-env.log"; then
+    fail "env selected the router even though the generated configuration disables it"
+fi
+env HOME="$state_home" PATH="$MOCK_BIN:$PATH" FAKE_ACTIVE_UNITS="$TEST_ROOT/state.active" \
+    FAKE_CURL_LOG="$TEST_ROOT/state-status-curl.log" \
+    "$DEPLOY_SCRIPT" status --prefix "$state_prefix" > "$TEST_ROOT/state-status.log" 2>&1
+grep -Fq 'http://127.0.0.1:8890/health/ready' "$TEST_ROOT/state-status-curl.log" \
+    || fail "status did not probe the generated service bind"
+if grep -Fq '8789' "$TEST_ROOT/state-status-curl.log" || grep -Fq 'router MCP tools' "$TEST_ROOT/state-status.log"; then
+    fail "status used stale service/router metadata instead of the generated configuration"
+fi
+pass "status and env read the generated custom bind and no-router configuration"
+
+systemd_path_expected() {
+    local input="$1"
+    local escaped="" char ordinal hex i
+    local LC_ALL=C
+    for ((i = 0; i < ${#input}; i++)); do
+        char="${input:i:1}"
+        case "$char" in
+            [A-Za-z0-9_./:-]) escaped+="$char" ;;
+            '%') escaped+='%%' ;;
+            *)
+                printf -v ordinal '%d' "'$char"
+                if [ "$ordinal" -ge 128 ]; then
+                    escaped+="$char"
+                else
+                    printf -v hex '\\x%02x' "$ordinal"
+                    escaped+="$hex"
+                fi
+                ;;
+        esac
+    done
+    printf '%s' "$escaped"
+}
+
+# Unit directive paths and EnvironmentFile values must survive systemd parsing.
+unit_home="$TEST_ROOT/home-systemd-path"
+unit_prefix="$TEST_ROOT/prefix with space %percent \$dollar \"quoted\" \\backslash"
+unit_active="$TEST_ROOT/systemd-path.active"
+mkdir -p "$unit_home"
+: > "$unit_active"
+env HOME="$unit_home" PATH="$MOCK_BIN:$PATH" FAKE_ACTIVE_UNITS="$unit_active" \
+    "$DEPLOY_SCRIPT" install --prefix "$unit_prefix" --binary "$FAKE_BINARY" \
+    --no-extensions --no-embeddings --supervisor systemd > "$TEST_ROOT/systemd-path.log" 2>&1
+unit_file="$unit_home/.config/systemd/user/com.agentrecall.service"
+unit_escaped_prefix="$(systemd_path_expected "$unit_prefix")"
+unit_exec_prefix="${unit_prefix//\\/\\\\}"
+unit_exec_prefix="${unit_exec_prefix//\"/\\\"}"
+unit_exec_prefix="${unit_exec_prefix//%/%%}"
+grep -Fqx "EnvironmentFile=$unit_escaped_prefix/config/env" "$unit_file" \
+    || fail "systemd EnvironmentFile path was not escaped"
+grep -Fqx "WorkingDirectory=$unit_escaped_prefix" "$unit_file" \
+    || fail "systemd WorkingDirectory path was not escaped"
+grep -Fqx "ExecStart=:/usr/bin/env \"$unit_exec_prefix/bin/agentrecall\" serve" "$unit_file" \
+    || fail "systemd ExecStart path was not quoted and escaped"
+grep -Fqx "StandardOutput=append:$unit_escaped_prefix/logs/serve.log" "$unit_file" \
+    || fail "systemd StandardOutput path was not escaped"
+grep -Fqx "StandardError=append:$unit_escaped_prefix/logs/serve.error.log" "$unit_file" \
+    || fail "systemd StandardError path was not escaped"
+env_escaped_prefix="${unit_prefix//\\/\\\\}"
+env_escaped_prefix="${env_escaped_prefix//\"/\\\"}"
+env_escaped_prefix="${env_escaped_prefix//\$/\\\$}"
+grep -Fqx "AGENTRECALL_DATABASE_PATH=\"$env_escaped_prefix/data/agentrecall.duckdb\"" \
+    "$unit_prefix/config/env" || fail "generated EnvironmentFile did not escape its custom database path"
+if command -v systemd-analyze >/dev/null 2>&1; then
+    if ! systemd-analyze --user verify "$unit_file" > "$TEST_ROOT/systemd-verify.log" 2>&1; then
+        cat "$TEST_ROOT/systemd-verify.log" >&2
+        fail "systemd-analyze rejected the generated custom-path unit"
+    fi
+fi
+pass "systemd unit and environment paths are escaped"
 
 run_readiness_failure() {
     name="$1"

@@ -1,5 +1,7 @@
 # Deployment and client wiring
 
+Two variants are described in the [README](../README.md#deployment): a scripted single-node deployment with `scripts/local-deploy.sh` for one machine, and the explicit deployment below for the two-node local+cloud topology. The rest of this document covers the explicit variant.
+
 ## Cloud instance
 
 Run one service process owning one disk-backed DuckDB file on durable storage. Bind the service privately behind a reverse proxy that terminates TLS; the public URL must be stable and end in `/mcp`. Configure the proxy to preserve `Authorization`, `Origin`, `Accept`, `Content-Type`, and `MCP-Protocol-Version`. Restrict ingress to MCP, health checks and the separate replication path; keep operator paths private. Never mount the same DuckDB file into another writer process.

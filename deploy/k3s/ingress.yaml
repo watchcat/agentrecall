@@ -1,0 +1,27 @@
+# Render __HOSTNAME__ only after domain confirmation and correct DNS.
+# This ingress does not publish health, metrics or the unconfigured replication route.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agentrecall
+  namespace: agentrecall
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: ["__HOSTNAME__"]
+      secretName: agentrecall-tls
+  rules:
+    - host: "__HOSTNAME__"
+      http:
+        paths:
+          - path: /mcp
+            pathType: Exact
+            backend:
+              service:
+                name: agentrecall
+                port:
+                  number: 8789

@@ -1103,3 +1103,7 @@ pxyEBI5NnfQ4Pb7C8KOhf5Jurr7Q22toifIScm7zSlHN2LAPJiT/0uhJ
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ar001_reproduction_tests.rs"]
+mod ar001_reproduction_tests;

@@ -736,6 +736,9 @@ cmd_install() {
     log "installing a single-node AgentRecall deployment into $PREFIX"
 
     [ -n "$PREFIX" ] || die "installation prefix must not be empty"
+    if [ -e "$PREFIX/config/replication.env" ] || [ -L "$PREFIX/config/replication.env" ]; then
+        die "this installation has explicit replication settings; refusing a single-node reinstall that would drop pairing (see docs/deployment.md)"
+    fi
     mkdir -p "$PREFIX"
     validate_prefix_directory
     mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$DATA_DIR/models" "$LOG_DIR" "$BACKUP_DIR"

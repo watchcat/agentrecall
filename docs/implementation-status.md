@@ -1,6 +1,18 @@
 # Implementation status and release gates
 
-The current source has passed Rust 1.100.0 build/test checks and a real local BGE-M3 inference smoke; it has not been deployed to production. The current automated suite covers verified backup/restore, snapshot-based peer seeding, atomic stale-watermark rejection, and a two-database restart/partition recovery scenario. A scripted single-node deployment was validated separately and is described below; the remaining production release gates are still unverified.
+**Latest status, 28 November 2026:** the native Rust/DuckDB service is deployed on Contabo k3s with semantic search and active replication to the actual local Hermes installation. All 17 live service-level acceptance checkpoints passed. This is an operational prototype, not production-complete. Earlier Rust/local-provider evidence is preserved below; the latest rollout did not rebuild or modify native application code.
+
+**Architecture decision, 26 November 2026:** [ADR-001](adr/0001-managed-cloud-node.md) selects Worker + SQLite-backed Durable Object + Vectorize for the future cloud replica. This is documented only: no managed cloud code, schema, resources or interoperability tests exist yet. The evidence below concerns the existing native Rust/DuckDB implementation. Managed-cloud acceptance adds mixed-backend protocol/seed conformance, canonical durability, asynchronous indexing, embedding privacy and recovery gates; it does not inherit a pass from native tests.
+
+## Latest native deployment and replication evidence
+
+The [native deployment](native-k3s-deployment.md) and [semantic provisioning/switch](native-semantic-deployment.md) retain the existing AMD64 image, data PVC and identity, with a separately verified read-only model cache and denied application egress. Authenticated HTTPS MCP and exact replication routes passed security/profile checks. Both running nodes report hybrid/HNSW.
+
+The [replication connection](native-replication-deployment.md) passed initial retained-history catch-up, sequential save/update/delete in both directions, English/Cantonese hybrid retrieval, cloud mutations retained during local outage, restart catch-up and cleanup of only two synthetic memories. Existing sample records, credentials/cursor, router, Scout/browser and stable replica identities were preserved. The distinct shared-owner Cue credential was tested, but actual Cue registration and recall/capture behavior were not.
+
+All 128 offline deployment/profile/replication/cache tests and ten local shell safety checkpoints passed. A private read-only audit confirmed 155 consistent events and 116 current envelopes with only confidence/importance float32 serialization differences. The native backup validator's false positive is unpatched; audited and fresh stopped-writer snapshots were retained without changing history. The authorized diagnostic cloud copy was removed.
+
+Initial bulk catch-up triggered one cloud liveness restart before recovery. Later probe timeouts and a current-container 1.73GiB peak under 2GiB remain capacity/performance follow-ups. Receiver-only cloud queue metrics report zero by design, so actual retained-event and canonical checks supplied the delivery proof. These limits and AR-001 are not solved by passing sequential acceptance.
 
 ## Verified before BGE-M3 integration
 
@@ -19,6 +31,8 @@ Before the BGE-M3 provider and Rust 1.100 migration, the core checks passed: `ca
 ## Current BGE-M3 and Rust status
 
 The reported final acceptance run on Rust 1.100.0 passed 57 tests with `cargo test --all-targets`; the reported `cargo check --all-targets` also passed with debug information disabled to fit the available disk. A later Mac rerun stopped before tests began because the disk filled, so it did not freshly rerun or supersede the reported 57-test result. The current source also passed `cargo fmt --check`, strict all-target/all-feature Clippy, and CLI `--help`. The release build passed in an earlier validation. Dependency audit results below refer to an earlier audited checkpoint and were not re-run against this current source state.
+
+The later [AR-001 reproduction](ar001-reproduction.md) added three test-only characterization cases: the Linux AMD64 container suite passed 60 tests, repeated all three cases ten times, and passed strict Clippy. Passing those cases demonstrates the concurrent-resolution bug, not a production fix. The draft fix remains unpromoted. The README/deployment commit reran formatting and the 128 deployment/cache tests, not a new Rust compilation.
 
 ### Dependency advisory notes from the earlier audit
 
@@ -66,12 +80,13 @@ The fixed retention limits are 90 days or 100,000 mutation events per origin, wh
 
 ## Remaining release gates
 
-- Extend BGE-M3 service validation beyond the successful save/search smoke: exercise update/delete and restart behavior with the real provider, and measure model quality, throughput, and memory on the intended hardware. The scripted single-node deployment restarted the service, but provider-backed retrieval after that restart was not re-measured.
-- Complete the real-provider VSS path: the single-node deployment reported an active HNSW index and scored cross-lingual retrieval, but the index rebuild after a service restart with BGE-M3 was not exercised, and cross-replica semantic retrieval with matched model versions is still unverified.
-- Confirm embedding model/version/dimension compatibility on both replicas before relying on cross-replica semantic retrieval.
+- Extend the completed real-provider CRUD/restart and cross-replica hybrid/HNSW tests to sustained load, embedding quality, throughput and peak resource measurements on the intended hardware.
+- Investigate blocking bulk replication/semantic work and health-probe sensitivity: initial catch-up caused a liveness restart and later probes also timed out. No probe/resource tuning was promoted.
+- Maintain embedding model/version/dimension compatibility across future replica/model upgrades; current live retrieval evidence is not a general model-upgrade conformance guarantee.
 - Validate live Cue and Hermes endpoints, active recall/capture behavior, and cross-client retrieval after deployment.
-- Run broader live cross-replica restart/disconnection and network-partition acceptance beyond the automated two-database scenario; also test conflicts, read-only/revoked credentials, namespace isolation, oversized/malformed requests, rate limits, client disconnects, token rotation, and redaction.
-- Complete production work for stable cloud hosting, verified TLS/reverse-proxy settings, separate durable local/cloud storage, managed secret rotation, controlled extension artifacts, encrypted backups and restore drills on target infrastructure, retention, and operational monitoring.
+- Extend completed sequential cross-replica outage/restart acceptance to broader network partitions, concurrent conflicts (AR-001), revoked/read-only credentials, malformed/oversized requests, rate limits, client disconnects, token rotation and redaction.
+- Correct the native backup validator's float32 false positive and improve receiver-side pending-event observability without rewriting history or treating zero outbound metrics as delivery proof.
+- Extend the deployed native hosting/TLS/separate-storage baseline with managed secret rotation, encrypted offsite backups, node-loss/restore drills, retention and operational monitoring.
 - Link route-affinity entries to replication acknowledgements and safely retire replicated entries; validate fallback and recovery across real local/cloud outages.
 
-Do not treat AgentRecall as production-complete until these gates pass. No production deployment has been completed.
+Do not treat the deployed prototype as production-complete until these gates pass. Service-level native replication success does not establish actual Cue behavior, concurrent-conflict correctness or production recovery.

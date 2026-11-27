@@ -1,0 +1,9 @@
+# Deny everything, re-include only unchanged build inputs.
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!migrations/
+!migrations/*.sql
+# Never send .git/.manus/config/.env/secrets/databases/models/target or other POCs.

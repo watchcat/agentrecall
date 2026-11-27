@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "provider": "bge-m3",
+  "fastembed_version": "7.8.0",
+  "repository": "gpahal/bge-m3-onnx-int8",
+  "revision": "2b34e84df040034d4b9eabb62383a87c18955822",
+  "dimension": 1024,
+  "cache_repository": "models--gpahal--bge-m3-onnx-int8",
+  "files": {
+    "model_quantized.onnx": {"size": 569958496, "sha256": "16de7ea1146ca427e14938ec3e9abfdcaff0e6ac76434cd693ac35d761250bcb"},
+    "tokenizer.json": {"size": 17082799, "sha256": "249df0778f236f6ece390de0de746838ef25b9d6954b68c2ee71249e0a9d8fd4"},
+    "config.json": {"size": 679, "git_blob_sha1": "5f24211b0788e88812e243780b0637e665d6e27e"},
+    "special_tokens_map.json": {"size": 964, "git_blob_sha1": "b1879d702821e753ffe4245048eee415d54a9385"},
+    "tokenizer_config.json": {"size": 1203, "git_blob_sha1": "95bd7c849ee6a47d5c92805af18d187239c1ba4a"}
+  },
+  "sources": [
+    "https://huggingface.co/api/models/gpahal/bge-m3-onnx-int8",
+    "https://huggingface.co/api/models/gpahal/bge-m3-onnx-int8/tree/2b34e84df040034d4b9eabb62383a87c18955822"
+  ],
+  "verified_at": "2026-11-27"
+}

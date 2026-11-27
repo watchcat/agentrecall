@@ -5,7 +5,11 @@
 
 AgentRecall is a self-hostable shared-memory service for AI agents and applications. It is written in Rust and exposes memory operations over MCP Streamable HTTP, with an embedded DuckDB database owned by each service instance. Clients use the service API; they never open database files directly.
 
-> **Status: prototype.** On Rust 1.100.0, `cargo fmt --check`, `cargo check --all-targets`, the 57-test `cargo test --all-targets` suite, strict Clippy, and CLI help passed locally; the release build passed in the prior validation. A real local BGE-M3 smoke test initialized the model, saved a Cantonese memory, and retrieved it with an English query. That service run had no VSS extension, so it used exact owner/namespace-scoped vector scoring; it did not exercise HNSW. A scripted single-node deployment (`scripts/local-deploy.sh`) was validated end to end on macOS with launchd, including an idempotent reinstall, a verified backup, and a clean uninstall; in that deployment the VSS extension was provisioned and `/health/ready` reported `hnsw_active: true` with `search_engine: duckdb_vss_hnsw`, and cross-lingual retrieval returned scored hits. Automated tests cover verified backup/restore, fresh-identity snapshot seeding, atomic stale-watermark rejection, and two-database recovery after a restart and partition. Full live two-node acceptance, Cue integration, and production deployment/security checks remain. See [implementation status and release gates](docs/implementation-status.md).
+**Current deployment, 28 November 2026:** local Hermes and a native Rust/DuckDB cloud replica on Contabo k3s are connected. Both run BGE-M3 hybrid/HNSW search. The local service initiates bidirectional event exchanges over authenticated HTTPS; all **17 live acceptance checkpoints** passed, including sequential CRUD, English/Cantonese retrieval, and catch-up after a local restart. See [the replication deployment report](docs/native-replication-deployment.md).
+
+> **Status: deployed prototype, not production-complete.** Native semantic deployment and service-level replication are verified; 128 offline deployment/cache tests and ten local shell safety checkpoints passed. Actual Cue registration/agent behavior, concurrent-conflict correctness, sustained-load resilience and offsite recovery remain separate gates. Initial bulk sync triggered one cloud liveness restart before recovery, and the native backup validator has a confirmed float32-serialization false positive. See [implementation status and release gates](docs/implementation-status.md).
+
+A future managed Cloudflare node was documented in [ADR-001](docs/adr/0001-managed-cloud-node.md): Worker + SQLite-backed Durable Object + Vectorize. It is not implemented or deployed and is not the backend of the running native cloud service.
 
 ## What it provides
 
@@ -13,9 +17,10 @@ AgentRecall is a self-hostable shared-memory service for AI agents and applicati
 - Per-client bearer credentials, owner and namespace authorization, scoped permissions, origin/host checks, request limits, and rate limiting.
 - Durable records, optimistic revision checks, idempotent saves, tombstones, expiry collection, and signed, filter-bound search cursors.
 - Optional local-initiated replication between independent database instances, with idempotent event application, atomic stale-watermark rejection, snapshot seeding for a fresh peer identity, and explicit retention/resolution of concurrent branches.
-- Lexical search remains available without optional extensions; DuckDB FTS/BM25 and semantic search are implemented. The local BGE-M3 provider smoke passed, using exact scoped-vector fallback because VSS was not installed.
+- Lexical search without optional extensions, DuckDB FTS/BM25, and optional BGE-M3 semantic search with scoped VSS/HNSW indexes or exact-scoring fallback. Hybrid/HNSW retrieval is verified on both running replicas.
 - An optional loopback-only router for Hermes that prefers the local service and uses the cloud route only under narrowly defined connection-failure conditions.
 - A scripted single-node deployment (`scripts/local-deploy.sh`) that installs, inspects, backs up, and removes a loopback-only service plus router, with locally generated `0600` secrets that are never printed.
+- A native k3s deployment script (`deploy-k8s.sh`) with private dotenv configuration, explicit semantic model provisioning, HTTPS-only ingress and optional receiver pairing.
 
 ## Architecture
 
@@ -34,7 +39,7 @@ flowchart TB
     Service --> Replication["Replication endpoint<br/>events · cursors · conflict branches"]
 ```
 
-The FTS and VSS indexes are rebuildable search aids. The service explicitly provisions extensions; startup does not download them. The BGE-M3 provider is opt-in through `AGENTRECALL_EMBEDDING_PROVIDER=bge-m3`. First use downloads model weights from Hugging Face to the local cache, while embedding inference runs in process. The release build passed, and a real local BGE-M3 inference smoke was separately completed. In that smoke, VSS was not installed, so semantic retrieval used exact owner/namespace-scoped vector scoring rather than HNSW. `.fastembed_cache/` is ignored by Git, and the model cache was not published. Without the provider setting, search remains lexical. No memory text is sent to an external embedding provider. See [VSS implementation notes](docs/vss-reference.md).
+The FTS and VSS indexes are rebuildable search aids. The service explicitly provisions extensions; startup does not download them. BGE-M3 is opt-in through `AGENTRECALL_EMBEDDING_PROVIDER=bge-m3`; standalone first use can download weights from Hugging Face to the local cache, while inference runs in process. The native k3s semantic profile instead provisions and verifies the model separately, mounts its cache read-only and denies application egress. Both running replicas report hybrid/HNSW; without the provider, search remains lexical. Model caches are not published, and memory text is not sent to an external embedding provider. See [VSS notes](docs/vss-reference.md) and [semantic deployment evidence](docs/native-semantic-deployment.md).
 
 ## Optional two-node topology
 
@@ -54,6 +59,12 @@ flowchart TB
 ```
 
 Replication is eventual, not a shared-database transaction. Each node owns and writes only its own database file; never mount one DuckDB file into multiple writer processes or copy files to synchronize nodes. Concurrent same-base writes are retained as conflict branches rather than silently applying last-writer-wins. The router does not access DuckDB and does not retry an ambiguous request. Its hashed write-route affinity currently lacks an acknowledgement-based retirement lifecycle tied to replication; this remains a release gate. See [deployment guidance](docs/deployment.md), [operations](docs/operations.md), and the [memory policy](docs/memory-policy.md).
+
+### Verified running pair
+
+The cloud MCP endpoint is `https://memory.all-your-base.net/mcp`. The Mac initiates exchanges every five seconds at exact HTTPS `/_internal/replication/exchange`; cloud has no outbound peer and no public Mac endpoint is required. Router cloud fallback was not enabled by pairing. Cue's distinct shared-owner credential is provisioned privately, but Cue registration itself was not performed.
+
+Replica trust covers **all retained owners and namespaces**, not only `shared`. MCP credentials still enforce client owner/namespace scopes; the Cue client is restricted to `shared`. A sleeping/offline Mac catches up when online while required history remains retained. Receiver-only cloud queue metrics report zero because no outbound peer is configured; use actual exchange/canonical evidence, not that metric alone, to verify cloud-to-local delivery. See [the connection report](docs/native-replication-deployment.md) for the completed tests and limits.
 
 ## Build and run locally
 
@@ -121,9 +132,13 @@ Read the token from the file rather than from the output; the script never print
 
 The install step is idempotent. Running it again reuses the active client token, re-provisions the extensions, and restarts the service instead of creating a second credential.
 
+An explicitly paired prefix containing `config/replication.env` is refused before reinstall mutation, so single-node defaults cannot silently remove pairing. Maintain that installation using its explicit two-node configuration.
+
 Useful options: `--prefix` moves the installation root, `--bind` and `--router-bind` change the loopback ports, `--client` and `--owner` set the identity of the created token, `--scopes` and `--namespaces` set its permissions, `--supervisor` selects `launchd`, `systemd`, or `none`, `--no-router` installs the service only, `--no-embeddings` keeps search lexical, `--no-extensions` skips extension provisioning, and `--binary` uses an already built binary instead of compiling.
 
 A backup needs the service stopped, because DuckDB allows a single writer per file. With launchd or systemd, the script stops only the services that were active, verifies the backup, then restores their prior state even if backup or verification fails. With `--supervisor none`, the script refuses to run a managed backup because it cannot stop or restore a manually launched service; stop it yourself and run the binary's `backup` command directly.
+
+**Known backup limitation:** typed float32 `confidence`/`importance` serialization can make native logical verification reject consistent history. A full read-only audit confirmed this on the running local installation; audited and fresh stopped-writer snapshots were retained without repairing the log or claiming native validation passed. Do not blindly edit history or replace a database to clear this error. See [the audited activation procedure](docs/native-replication-deployment.md#local-backup-false-positive-and-authorized-audit).
 
 ### Variant 2: explicit deployment
 
@@ -135,6 +150,18 @@ Use this variant for the two-node local+cloud topology, for a shared host, or wh
 4. Configure the cloud node, the replication credentials, and the peer variables on the local node.
 
 Follow the complete [deployment guide](docs/deployment.md) for the exact environment variables, unit files, and reverse-proxy settings.
+
+For the native AMD64 k3s variant, use [`deploy-k8s.sh`](deploy-k8s.sh) and the [k3s operations guide](deploy/k3s/README.md). A new environment starts from the non-secret [`.env.k8s.example`](.env.k8s.example); keep actual values in a Git-ignored mode-0600 `.env`. The script parses dotenv as literal data, preserves existing identities/credentials and does not automatically build an image or download models.
+
+With the tested image imported and the semantic model cache separately provisioned and verified:
+
+```sh
+./deploy-k8s.sh --profile semantic --dry-run
+./deploy-k8s.sh --profile semantic
+./deploy-k8s.sh --profile semantic --check
+```
+
+Use the separate `--profile semantic --provision-model` command only for intentional model preparation. The current private `.env` still defaults to lexical: **always pass `--profile semantic` for this cloud deployment**. Receiver pairing uses a dedicated replication Secret and exact HTTPS route; the local peer trio is configured separately, never as cloud outbound settings in root `.env`.
 
 | | Variant 1 | Variant 2 |
 | --- | --- | --- |
@@ -155,7 +182,7 @@ cargo run --release -- install-fts
 cargo run --release -- install-vss
 ```
 
-FTS accelerates lexical retrieval. The semantic search path is covered by a deterministic test adapter, and actual local BGE-M3 inference was smoke-tested through an isolated service: it saved a Cantonese memory and retrieved it with an English query. VSS was not installed for that run, so retrieval used exact owner/namespace-scoped vector scoring and did not exercise HNSW. A later single-node deployment installed through `scripts/local-deploy.sh` did provision VSS and reported `hnsw_active: true` with `search_engine: duckdb_vss_hnsw`, and cross-lingual queries returned scored hits; that evidence covers one node, not a replicated pair. With VSS provisioned, AgentRecall can persist model/version-tagged derived vectors and build per-owner/per-namespace HNSW indexes in memory. Without an embedding adapter, search remains lexical. Expired and deleted records are removed from derived search projections as part of retrieval and mutation handling.
+FTS accelerates lexical retrieval. With VSS provisioned, AgentRecall persists model/version-tagged derived vectors and builds per-owner/per-namespace HNSW indexes in memory. Real BGE-M3 inference, update/delete retrieval and restart behavior were tested during native semantic provisioning; live acceptance then verified English/Cantonese hybrid retrieval after cross-replica changes and local restart. This does not establish embedding quality or throughput at scale. Without an embedding adapter, search remains lexical. Expired and deleted records are removed from derived search projections as part of retrieval and mutation handling.
 
 The local replica initiates HTTPS exchanges with the cloud endpoint when `AGENTRECALL_PEER_URL`, `AGENTRECALL_PEER_TOKEN`, and `AGENTRECALL_PEER_REPLICA_ID` are configured. Replication is optional; without a peer, the service can run standalone. Replication credentials are separate from MCP client credentials. Delivery is at-least-once and event application is idempotent. The hourly collector emits tombstones for expired records and prunes mutation history at the first fixed limit reached: 90 days of age or 100,000 events per origin. Neither limit is runtime-configurable, and compaction does not wait for peer acknowledgements. It retains each record's current version envelope with canonical state. Exchanges below a required pruning watermark are rejected atomically before inbound events are applied or either cursor advances. A stale peer cannot recover pruned history by restarting; provision a new peer from a verified snapshot with `seed-peer` and a fresh replica ID. This does not merge writes that exist only on the old stale database, so preserve and reconcile those before replacing it. Conflicts require an operator to inspect retained branches and explicitly resolve them.
 
@@ -178,4 +205,4 @@ Review [deletion and retention](docs/operations.md#deletion-and-retention), [bac
 - The service logs operational metadata, not memory content or bearer headers; review deployment logging and retention as part of acceptance.
 - Encrypt backups at rest and test restore procedures independently for each replica.
 
-The current 57-test local suite exercises retention collection, age/count-bounded event-log compaction independent of peer acknowledgements, current-state preservation, stale-cursor refusal, and verified backup/restore on test databases. Local builds and a BGE-M3 smoke test still do not verify production availability, cloud TLS, real client interoperability, embedding quality/performance at scale, or two-node restart/disconnection acceptance. Complete the remaining [release gates](docs/implementation-status.md) before relying on a public deployment.
+The historical 57-test Rust suite covers retention, state preservation, stale-cursor refusal and backup/restore on disposable databases. Native deployment additionally passed 128 offline Python tests, ten local shell safety checkpoints, authenticated HTTPS/profile checks and 17 live replication checkpoints. These are not proof of production availability or real client memory-use behavior: Cue registration, concurrent-conflict correctness (AR-001), bulk-load/probe resilience, secret rotation and offsite recovery remain gates. One cloud liveness restart occurred during initial bulk catch-up before recovery; the backup float32 false positive is also unpatched. Complete the remaining [release gates](docs/implementation-status.md) before treating the deployment as production-ready.

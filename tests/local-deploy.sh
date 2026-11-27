@@ -161,6 +161,24 @@ for bind_kind in service router; do
 done
 pass "non-loopback service and router binds are rejected before installation side effects"
 
+# Explicitly paired installations must not be silently turned into single-node ones.
+paired_prefix="$TEST_ROOT/paired-prefix"
+paired_home="$TEST_ROOT/home-paired"
+mkdir -p "$paired_prefix/config" "$paired_home"
+printf 'AGENTRECALL_PEER_TOKEN=synthetic-private-pairing-token\n' > "$paired_prefix/config/replication.env"
+cp "$paired_prefix/config/replication.env" "$TEST_ROOT/paired-before.env"
+if env HOME="$paired_home" PATH="$MOCK_BIN:$PATH" FAKE_ACTIVE_UNITS="$TEST_ROOT/paired.active" \
+    "$DEPLOY_SCRIPT" install --prefix "$paired_prefix" --binary "$FAKE_BINARY" --no-extensions \
+    --supervisor none > "$TEST_ROOT/paired.log" 2>&1; then
+    fail "silently replaced a paired installation"
+fi
+cmp -s "$paired_prefix/config/replication.env" "$TEST_ROOT/paired-before.env" || fail "changed pairing configuration"
+[ ! -e "$paired_prefix/bin" ] || fail "changed paired prefix before rejecting single-node install"
+if grep -q 'synthetic-private-pairing-token' "$TEST_ROOT/paired.log"; then
+    fail "leaked pairing token in install rejection"
+fi
+pass "paired deployment reinstall is refused without side effects or secret output"
+
 # A broad prefix such as ~/.local/share must not be recursively purged.
 purge_home="$TEST_ROOT/home-purge"
 broad_prefix="$purge_home/.local/share"

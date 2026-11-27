@@ -1,0 +1,187 @@
+# MiniMax-M3 draft, reviewed and corrected by Manus; see SPEC-native-k3s.md.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agentrecall
+  labels:
+    app: agentrecall
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agentrecall-data
+  namespace: agentrecall
+  labels:
+    app: agentrecall
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentrecall
+  namespace: agentrecall
+  labels:
+    app: agentrecall
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: agentrecall
+  template:
+    metadata:
+      labels:
+        app: agentrecall
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agentrecall
+          image: __IMAGE__
+          imagePullPolicy: Never
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: AGENTRECALL_ROLE
+              value: cloud
+            - name: AGENTRECALL_BIND_ADDR
+              value: "0.0.0.0:8789"
+            - name: AGENTRECALL_DATABASE_PATH
+              value: /state/data/cloud.duckdb
+            - name: AGENTRECALL_TOKENS_FILE
+              value: /credentials/tokens.json
+            - name: AGENTRECALL_REPLICA_ID
+              value: __REPLICA_ID__
+            - name: AGENTRECALL_ALLOWED_HOSTS
+              value: memory.all-your-base.net,agentrecall,agentrecall.agentrecall.svc.cluster.local,127.0.0.1,localhost
+            - name: AGENTRECALL_CURSOR_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: agentrecall-runtime
+                  key: cursor-key
+            - name: HOME
+              value: /home/agentrecall
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 8789
+              scheme: HTTP
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8789
+              scheme: HTTP
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8789
+              scheme: HTTP
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - kill -INT 1
+          volumeMounts:
+            - name: agentrecall-data
+              mountPath: /state/data
+            - name: runtime-credentials
+              mountPath: /credentials
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: agentrecall-data
+          persistentVolumeClaim:
+            claimName: agentrecall-data
+        - name: runtime-credentials
+          secret:
+            secretName: agentrecall-runtime
+            defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentrecall
+  namespace: agentrecall
+  labels:
+    app: agentrecall
+spec:
+  type: ClusterIP
+  selector:
+    app: agentrecall
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8789
+      targetPort: 8789
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agentrecall
+  namespace: agentrecall
+  labels:
+    app: agentrecall
+spec:
+  podSelector:
+    matchLabels:
+      app: agentrecall
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8789
+  egress: []

@@ -9,6 +9,8 @@ AgentRecall is a self-hostable shared-memory service for AI agents and applicati
 
 > **Status: deployed prototype, not production-complete.** Native semantic deployment and service-level replication are verified; 128 offline deployment/cache tests and ten local shell safety checkpoints passed. Actual Cue registration/agent behavior, concurrent-conflict correctness, sustained-load resilience and offsite recovery remain separate gates. Initial bulk sync triggered one cloud liveness restart before recovery, and the native backup validator has a confirmed float32-serialization false positive. See [implementation status and release gates](docs/implementation-status.md).
 
+Remaining work is tracked in [the production-readiness tasks](tasks/production-readiness.md), with priorities, dependencies and acceptance criteria linked to [GitHub issues](https://github.com/watchcat/agentrecall/issues). Passing prototype checks do not close those release gates.
+
 A future managed Cloudflare node was documented in [ADR-001](docs/adr/0001-managed-cloud-node.md): Worker + SQLite-backed Durable Object + Vectorize. It is not implemented or deployed and is not the backend of the running native cloud service.
 
 ## What it provides

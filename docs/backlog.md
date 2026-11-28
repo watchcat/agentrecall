@@ -1,10 +1,12 @@
 # AgentRecall fixes and improvements backlog
 
-Created 26 November 2026 from the review of HEAD `31e715e`. These are proposed development issues, not fixes silently included in the cloud compatibility proof. Status of every issue is **open**. Priorities express release risk, not evidence of a production incident. Findings began with static review; AR-001 now has a deterministic local reproduction, while unverified schedules still require their own reproductions. The historical Rust test results do not replace fresh acceptance tests.
+Created 26 November 2026 from the review of HEAD `31e715e`; extended on 28 November after live native semantic replication acceptance. The 26 stable items remain **open**, with AR-020 on a separate future-managed-cloud track. Partial documentation/tests and the 17 passing service checkpoints are evidence, not blanket closure. Historical source line references identify the reviewed baseline; locate current code before implementation. AR-001 has a deterministic reproduction, while AR-017 now also has observed liveness-failure evidence. No fixes are authorized merely by task creation.
 
 P0 means required before trusting the affected distributed-write path with important memories. P1 means next shared-memory usability, privacy or recovery milestone. P2 means measured performance or maintainability improvement. IDs remain stable when priorities or order change.
 
 **Architecture amendment, 26 November 2026:** [ADR-001](adr/0001-managed-cloud-node.md) selects Worker + SQLite-backed Durable Object + Vectorize for the cloud replica; local Rust/DuckDB remains. AR-020 now tracks managed-cloud acceptance rather than mandatory Container/R2 deployment. AR-009 must cover the mixed-backend pair. All 20 issues remain open; the backend decision does not fix router/replication correctness or authorize implementation. Cloud embedding privacy, version-aware indexing and logical mixed-backend seeding must be covered by the upcoming managed-cloud specifications.
+
+**Native milestone amendment, 28 November 2026:** the running cloud is native Rust/DuckDB on Contabo k3s, not the future ADR-001 backend. Native semantic provisioning, HTTPS checks and sequential bidirectional restart acceptance passed. AR-009 still requires actual clients; AR-014's scope documentation and one Cue namespace denial passed, but its complete privacy matrix remains. AR-017 is now P1. AR-021–AR-026 cover the newly observed backup/receiver-metric gaps and missing native recovery, rotation, failure-matrix and model-upgrade gates. Sixteen README-relevant items have GitHub tasks and focused checklists in [the production-readiness task index](../tasks/production-readiness.md). Conditional router fallback work is not a requirement to enable fallback on the current local-only router, and AR-020 is not a prerequisite for this native milestone.
 
 ## Correctness gates
 
@@ -62,7 +64,7 @@ Acceptance: dependency-free unittest discovery runs on every relevant change and
 
 ### AR-009 — Prove real Hermes and Cue lifecycle on two isolated nodes
 
-**P1 release gate · dependencies: AR-001, AR-002, AR-004, AR-005, AR-008; a verified cloud host or equivalent two-node fixture.** Mock plugin tests do not establish actual lifecycle/MCP interoperability.
+**P1 release gate · dependencies for full sign-off: AR-001, AR-004, AR-005, AR-008, AR-011 and AR-017; AR-002 only for fallback scenarios.** Native hosting and service-level pairing are verified. Registration and non-conflicting synthetic client exercises can begin independently; mock plugin tests and a provisioned Cue token do not establish actual lifecycle/MCP interoperability. A future mixed-backend extension remains part of AR-020, not a prerequisite to testing the running native pair.
 
 Acceptance: pin supported client versions and reproduce registration, pre-turn injection, capture, native add/replace/remove, JSON/SSE handling, shutdown and scrubbing. Run local/cloud save and recall, outages/recovery, ambiguous acknowledgments, conflicts, corrections and deletion with synthetic data. Verification: repeatable end-to-end script with evidence for both clients/nodes; no live memories or routing changes. Successful Docker packaging alone does not close this issue.
 
@@ -98,6 +100,8 @@ Acceptance: explicit duplicate-detection/response-retention window and post-dele
 
 Acceptance: document replica-wide trust and exact namespace residency before using real memories. If local-only residency is required, design a separate nonreplicated store or a feed/cursor scheme that correctly represents filtering; do not drop entries from existing contiguous sequences. Verification: explicit two-node namespace/privacy matrix and unauthorized-client checks, plus cursor/progress tests if filtering is introduced.
 
+**28 November evidence:** whole-replica trust was disclosed/documented, and the Cue credential's denial of `hermes` was tested. Complete the synthetic owner/namespace matrix rather than duplicating that passed checkpoint. Namespace-selective replication is not implicitly required by this task.
+
 ### AR-015 — Surface NeedsReseed and preserve unsent local mutations
 
 **P1 · dependencies: AR-009.** Fixed 90-day/100,000-event pruning can strand an offline peer; retries cannot recreate pruned history and reseeding is not a merge. Evidence: `src/store.rs:236–237`, `1650–1653`, `2172–2224`; `src/replication.rs:113–120`; `docs/operations.md:123–140`.
@@ -114,7 +118,7 @@ Acceptance: owner/client/memory/namespace/operation identities and supported bou
 
 ### AR-017 — Move blocking work off async workers and bound admission
 
-**P2, raise to P1 if measured liveness fails · dependencies: AR-009 and baseline from AR-018.** Synchronous database/inference and projection rebuilds occur under shared locks in async handlers. Evidence: `src/mcp_server.rs:36–45`, `68–77`; `src/store.rs:826–884`, `1116–1196`, `1727–1758`, `2379–2407`.
+**P1 · dependencies: none for diagnosis; coordinate timing/resource baseline with AR-018 and later client coverage with AR-009.** Initial bulk catch-up triggered a cloud liveness restart, and later probes timed out. Kubernetes recorded liveness termination, not `OOMKilled`. Blocking database/inference and projection work is a plausible static-review explanation, not yet a proven sole cause. Evidence: [the live report](native-replication-deployment.md#observed-bulk-sync-restart-and-capacity-boundary), plus `src/mcp_server.rs:36–45`, `68–77`; `src/store.rs:826–884`, `1116–1196`, `1727–1758`, `2379–2407` at the reviewed baseline.
 
 Acceptance: bounded blocking/database workers, explicit admission/backpressure and responsive health/replication; canonical mutation/event atomicity preserved. Coalesced index refresh requires an explicit freshness/fallback contract. Verification: concurrent save/search/sync under slow DB/inference/rebuild; queue bounds, health latency, cancellation/timeout and memory measurements. No database rewrite solely on static suspicion.
 
@@ -124,7 +128,7 @@ Acceptance: bounded blocking/database workers, explicit admission/backpressure a
 
 Acceptance: full request plus component timings; reproducible multilingual/name/ID/paraphrase/distractor/obsolete/no-result corpus; precision/recall and filtered-candidate starvation measured before choosing adaptive retrieval, fusion or index tuning. Verification: benchmark includes matching semantic records outside the first 256 unfiltered candidates; retain exact/lexical fallback and record model/version/hardware. Optional-disabled embeddings in the local container proof do not close this issue.
 
-Managed-cloud scope: include Workers AI query latency, Vectorize candidate limits, indexing visibility delay and provider/index failure behavior. Compare retrieval quality across independently derived local/cloud indexes; do not require identical vectors or rankings across different models. Authorization, current-version, deletion and expiry checks remain mandatory even while Vectorize is stale. Semantic latency/quality must be measured end to end, not inferred from managed-service availability.
+Future managed-cloud extension, not a prerequisite for the native milestone: include Workers AI query latency, Vectorize candidate limits, indexing visibility delay and provider/index failure behavior. Compare retrieval quality across independently derived local/cloud indexes; do not require identical vectors or rankings across different models. Authorization, current-version, deletion and expiry checks remain mandatory even while Vectorize is stale. Semantic latency/quality must be measured end to end, not inferred from managed-service availability.
 
 ### AR-019 — Split store responsibilities while preserving invariants
 
@@ -134,11 +138,49 @@ Acceptance: focused internal modules with unchanged external APIs/semantics and 
 
 ### AR-020 — Validate cloud durability and single-writer operations before live use
 
-**P1 cloud release gate · dependencies: reviewed managed-cloud capability map/specifications, protocol conformance fixtures and AR-009.** The active target is Worker + SQLite-backed Durable Object + Vectorize, as selected in ADR-001. Managed persistence is not evidence of correct canonical/event transactions, protocol parity or safe recovery. Completed native proofs remain optional-alternative evidence, not prerequisites for this route.
+**P1 future managed-cloud release gate, deferred from the current native milestone · dependencies: reviewed managed-cloud capability map/specifications, protocol conformance fixtures and AR-009's client contract.** This issue retains the Worker + SQLite-backed Durable Object + Vectorize scope selected in ADR-001. That backend is not running; native deployment does not close its canonical/event transaction, protocol parity or recovery gates. Native recovery/security work is tracked separately in AR-023/AR-025 rather than mislabelled as a managed-backend pass.
 
 Acceptance: durable atomic canonical/event/idempotency/outbox transactions, safe replica identity and sequence ownership through restarts/deployments, reviewed SQLite migrations and secrets, version-aware indexing/reconciliation, scoped semantic filtering and explicit provider privacy. Verify logical snapshot seeding between DuckDB and SQLite and restore/reindex without unsafe sequence reuse or deleted-content resurrection. The local node keeps its own DuckDB file and existing event protocol; no database-file synchronization.
 
 Verification: authenticated MCP and replication conformance; acknowledged canonical-write crash/restart recovery; duplicate retries; synthetic bidirectional local DuckDB/cloud SQLite sync through partitions, conflicts and deletion; delayed/failed/out-of-order indexing; provider-disabled fallback; managed restore and search rebuild. Vectorize acknowledgment must not masquerade as immediate search visibility. Account plan/API access does not establish implementation or deployment. The older private-R2 and Container-rollout criteria apply only if that native alternative is separately revived.
+
+## Native release tasks added after live acceptance
+
+### AR-021 — Correct float32 false positives in native backup verification
+
+**P1 · dependencies: none.** A full read-only audit found consistent local history, but native validation rejected equivalent typed-f32 confidence/importance representations. This blocks dependable backup/restore/seed verification despite no genuine corruption.
+
+Acceptance: use a narrow typed-f32 comparison correction while preserving exact raw event-column agreement and all operation, identity, sequence, cursor and current-state checks. Do not introduce general numeric tolerance or repair live history. Verification: synthetic precision fixtures pass native backup/restore/seed, genuine corruption still fails, source bytes/history remain unchanged and overwrite is refused. See [the audit evidence](native-replication-deployment.md#local-backup-false-positive-and-authorized-audit).
+
+### AR-022 — Expose receiver-side pending events and lag meaningfully
+
+**P1 · dependencies: none; coordinate stale-peer diagnostics with AR-015.** Receiver-only cloud reports zero outbound queue/lag without an outbound peer, even when retained cloud events await the Mac.
+
+Acceptance: directional pending count/age and truthful unconfigured/unavailable states derived from durable sequence/acknowledgement data; no outbound-peer configuration or egress expansion merely for metrics. No memory-bearing/high-cardinality labels. Verification: two cloud writes while local is stopped make pending state visible, restart/replay preserve counts and actual acknowledgement drains them; diagnostics remain private.
+
+### AR-023 — Prove encrypted offsite backup and native node-loss recovery
+
+**P1 · dependencies: AR-021 and AR-015.** The retained snapshots/PVC are same-node recovery material. Define and approve RPO/RTO, storage destinations, retention and key custody before live export or automation.
+
+Acceptance: encrypted verified copies outside each source node, recoverable keys and a timed synthetic restore/reseed drill that preserves canonical/event/idempotency/cursor state, prevents duplicate active identities/writers and reconciles unique stale writes. Verification: simulate source-storage loss on isolated fixtures and restore onto a fresh native node, not just a pod on the same PVC. Task creation does not authorize real-memory export, storage purchase, unattended jobs or destructive live tests.
+
+### AR-024 — Validate coordinated credential and cursor-key rotation
+
+**P1 · dependencies: AR-021 for verified recovery checkpoints.** Normal deployment deliberately refuses secret mismatch; rotation needs an explicit operator workflow, not weaker preservation guards.
+
+Acceptance: supported MCP revoke/rotate, bounded cursor-key overlap and coordinated replication-bearer transition with safe configuration recovery. Preserve identities, data, other credentials and semantic profile; no secrets in argv/logs/source control or automatic database rollback. Verification: isolated new/old/wrong credentials, partial updates, restart and catch-up fixtures. Live rotation is a separately authorized action.
+
+### AR-025 — Extend native failure/security acceptance beyond sequential CRUD
+
+**P1 · dependencies for full sign-off: AR-001, AR-015, AR-017 and AR-024; coordinate malformed-event behavior with AR-016.** Existing TLS/profile/denial checks and 17 sequential checkpoints are a passed baseline, not a complete fault/security matrix.
+
+Acceptance: acknowledged-write durability and safe replay under lost responses, mid-exchange disconnects, partitions and restart; atomic malformed/mismatched/oversized rejection; scoped read-only/revoked credentials, rate limits and redaction. Preserve TLS/host verification, exact routes, private diagnostics and denied cloud egress. Verification: bounded versioned synthetic two-node matrix with honest passed/failed/blocked/not-run outcomes and subsequent valid-stream progress.
+
+### AR-026 — Validate model compatibility and safe upgrades
+
+**P1 before a model upgrade · dependencies: AR-018's versioned corpus/baseline.** Current BGE-M3 retrieval success is not a general model/version/dimension or cache-upgrade conformance guarantee. The current pinned model need not change.
+
+Acceptance: explicit supported upgrade/reindex rules, verified caches and truthful semantic readiness or approved fallback under mismatched models/dimensions/cache drift. Derived rebuilds change no canonical history, identities or cursors and resurrect no deleted/expired content. Verification: disposable mismatch/provider-disabled/cache/restart fixtures and corpus-based quality/latency comparison; no implicit model download, cache relabeling or requirement for identical rankings across models.
 
 ## What stays unchanged unless evidence justifies a decision
 
@@ -148,4 +190,6 @@ Defer more peers, generalized CRDTs, a knowledge graph, additional vector infras
 
 ## Suggested execution order
 
-Reproduce/fix AR-001 and AR-002; decide safe retry/retention horizons jointly for AR-003/AR-013. Land AR-004/AR-005/AR-006 and AR-008 as small interoperability tasks. Establish AR-009 and AR-020 on synthetic isolated nodes, while clarifying AR-014 residency. Then address AR-010–AR-016 and measure AR-018 before deeper performance/refactoring work. Existing deployment acceptance and current proof reports must state exactly what ran and what remains blocked.
+For the current native pair, start the narrow AR-021 backup correction and independent AR-017/AR-022 diagnosis/observability, while reviewing AR-001's already reproduced correctness defect. AR-018's measurement baseline can support liveness work before its broader quality study. Registration/non-conflicting AR-009 client exercises and AR-014's remaining privacy matrix can start without waiting for every release gate; full client sign-off cannot.
+
+Then validate AR-011/AR-013/AR-015 and the native rotation/recovery/failure gates AR-024/AR-023/AR-025 in dependency order. Complete AR-018 quality evidence before AR-026 upgrade sign-off. AR-002 → AR-003 is conditional work before enabling long-running fallback, coordinated with AR-013; it is not an instruction to change the current router. Keep AR-020 and the future managed backend separate. The detailed focused-session checklists and GitHub links are in [the production-readiness task index](../tasks/production-readiness.md).
